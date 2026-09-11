@@ -1,0 +1,14 @@
+# Normalise line endings to LF in the repository AND in the working tree.
+#
+# This matters for deployment, not aesthetics: run_cycle.sh is scp'd to a Linux
+# VPS and executed by cron. A CRLF shebang fails there with "bad interpreter",
+# and the failure is silent from the fund's point of view.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# Binary-ish safety net (nothing currently matches, but keeps future artefacts sane)
+*.png binary
+*.gz binary

@@ -1,0 +1,18 @@
+# .gitignore — runtime state is NOT source.
+
+# Ledger, account, positions, snapshots, rejection logs: these evolve on every
+# cycle on the VPS and are the fund's live book, not code. Committing them would
+# make every cycle a merge conflict.
+state/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Scratch
+*.log
+*.tmp
+.DS_Store

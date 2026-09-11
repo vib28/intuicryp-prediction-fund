@@ -1,0 +1,59 @@
+{
+  "fund": {
+    "name": "IntuiCryp Prediction Fund",
+    "venue": "polymarket",
+    "venue_reason": "deepest crypto order books and open read APIs; Kalshi retained as a second reference price",
+    "mode": "paper",
+    "capital_usd": 100.0,
+    "target_usd": 1000.0,
+    "exit_policy": "hold_to_resolution",
+    "exit_policy_reason": "measured round-trip cost is 4%-42% of stake; only hold-to-resolution survives"
+  },
+  "burn": {
+    "vps_weekly_usd": 5.0,
+    "tokens_weekly_usd": 10.0,
+    "total_weekly_usd": 15.0,
+    "note": "accrued per second against cash so it cannot be forgotten"
+  },
+  "scan": {
+    "pages": 6,
+    "interval_minutes": 30,
+    "rejections_max_bytes": 5000000,
+    "daily_assets": ["bitcoin", "ethereum"],
+    "daily_days_ahead": 3,
+    "search_queries": [
+      "what price will bitcoin hit",
+      "what price will ethereum hit",
+      "bitcoin above"
+    ]
+  },
+  "universe": {
+    "min_volume_24h_usd": 5000,
+    "min_liquidity_usd": 1000,
+    "max_spread": 0.03,
+    "min_days_to_resolution": 0.6,
+    "max_days_to_resolution": 120,
+    "min_ask": 0.02,
+    "max_ask": 0.97
+  },
+  "risk": {
+    "sizing_mode": "fixed_fraction",
+    "sizing_note": "fixed_fraction deliberately over-sizes vs Kelly so a $100 account can deploy at all; kelly is always computed and stored for comparison",
+    "fixed_fraction_pct": 10.0,
+    "max_position_pct": 20,
+    "absolute_max_position_usd": 20.0,
+    "min_position_usd": 5.0,
+    "probe_stake_usd": 20.0,
+    "min_book_depth_usd": 500,
+    "max_concurrent_positions": 3,
+    "defensive_equity_usd": 50.0,
+    "dead_equity_usd": 25.0,
+    "fractional_kelly": 0.25,
+    "min_ev_on_stake_pct": 3.0
+  },
+  "costs": {
+    "fee_rate_source": "market.feeSchedule.rate (crypto_fees_v2 = 0.07)",
+    "settlement_fee_usd": 0.0,
+    "formula": "taker_fee = rate * shares * p * (1 - p)"
+  }
+}
