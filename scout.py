@@ -185,9 +185,17 @@ def scan(cfg: dict) -> tuple[list[dict], list[dict]]:
         spread = ask - bid
         if spread > u["max_spread"]:
             reject("spread_too_wide", spread=round(spread, 4)); continue
-        # A near-certain market has no room to pay the fee: skip 1c/99c dead zones
-        if ask <= u["min_ask"] or ask >= u["max_ask"]:
-            reject("price_in_dead_zone", ask=ask); continue
+        # A near-certain strike has no room left to pay the fee, so we must not
+        # TRADE it. But it still carries information about the market's implied
+        # vol, and smile.py needs a full strike ladder to establish a consensus.
+        # So it stays a candidate, flagged, and risk.py declines to trade it.
+        #
+        # Getting this wrong silently destroyed the entire daily universe: BTC
+        # strikes are $2000 apart with ~1.6% daily vol, so only ~2 strikes sit
+        # inside a 0.02-0.97 price band. Dropping the rest left groups of 2,
+        # below the 4-strike minimum for a vol consensus, and every daily
+        # market was discarded by the anchoring step.
+        dead_zone = ask <= u["min_ask"] or ask >= u["max_ask"]
 
         candidates.append({
             "market_id": str(m.get("id")),
@@ -205,6 +213,7 @@ def scan(cfg: dict) -> tuple[list[dict], list[dict]]:
             "best_ask": ask,
             "spread": spread,
             "tick": m.get("orderPriceMinTickSize"),
+            "dead_zone": dead_zone,
             "fee_rate": (m.get("feeSchedule") or {}).get("rate"),
             "fee_type": m.get("feeType"),
             "fees_enabled": m.get("feesEnabled"),

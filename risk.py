@@ -59,6 +59,8 @@ def evaluate(priced: list[dict], cfg: dict) -> tuple[list[dict], list[dict]]:
     approved, rejected = [], []
     for r in rows:
         reasons = []
+        if r.get("dead_zone"):
+            reasons.append(f"price_in_dead_zone:{r['best_ask']:.3f}")
         if r["edge"]["ev_on_stake_pct"] < MIN_EV_ON_STAKE_PCT:
             reasons.append(f"ev_below_hurdle:{r['edge']['ev_on_stake_pct']:.2f}%")
         if r["edge"]["edge_prob"] <= 0:

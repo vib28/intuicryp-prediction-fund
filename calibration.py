@@ -4,31 +4,46 @@ Calibration — is the model actually any good?
 WHY THIS EXISTS
 ---------------
 The fund has taken ZERO trades, because no dislocation has cleared the cost
-hurdle. That means we have no evidence at all about whether the model works,
-and "we found no edge" is indistinguishable from "the model is broken".
+hurdle. That means we have no evidence about whether the model works, and
+"we found no edge" is indistinguishable from "the model is broken".
 
-We do not need to risk money to find out. Every cycle prices ~56 markets. Each
-one resolves. So we record the prediction AND score it at settlement, whether or
-not we traded it. Within a week that gives hundreds of graded predictions for
-free, which is the only honest way to answer:
+We do not need to risk money to find out. Every cycle prices ~57 markets, and
+every market resolves. So we record each prediction AND grade it at settlement,
+whether or not we traded it.
 
-    when the model says 0.20, does it happen 20% of the time?
+THE CLUSTERING TRAP (read this before trusting any number here)
+--------------------------------------------------------------
+A market living 3 days gets recorded once per 12h bucket, so it can contribute
+6 graded rows with the SAME outcome. That inflates n and correlates the
+observations, which makes any confidence in the result look far better than it
+is. So this module reports TWO samples:
+
+  * ALL PREDICTIONS — every graded row. More data, correlated.
+  * ONE PER MARKET  — a single row per distinct market (the LAST forecast made
+    before settlement, i.e. the most informed one). Independent, honest, and
+    the number that should drive decisions.
+
+If the two disagree materially, trust ONE PER MARKET and treat the headline
+sample size as `distinct_markets`, not `rows`.
+
+A second, subtler bias: we only record markets that already passed the Scout's
+liquidity/horizon/spread filter. So this measures the model on LIQUID,
+LONGER-DATED markets — not a random sample of crypto outcomes. It answers "is
+the model honest where we would actually trade?", which is the useful question,
+but it is not a general-purpose vol-model scorecard.
 
 Metrics:
   * Brier score  — mean squared error of the probabilities. Lower is better.
-                   0.25 is the score of always saying 0.50 (a coin flip).
-  * Reliability  — bucketed predicted vs realized frequency. THIS is the number
-                   that matters: it exposes systematic over/under-confidence.
-                   A model can have a good Brier score and still be badly
-                   miscalibrated in the tails, which is exactly where we trade.
-  * Skill score  — 1 - (Brier / 0.25). Positive means better than a coin flip.
-
-Predictions are recorded at most once per market per bucket window, so volume
-stays bounded (56 markets x 2 buckets/day instead of 56 x 48 cycles).
+                   0.25 is what you get by always saying 0.50.
+  * Skill score  — 1 - (Brier / baseline). Positive = better than a coin flip.
+  * Reliability  — bucketed predicted vs realized frequency. THE number that
+                   matters: it exposes systematic over/under-confidence, and
+                   the tails are exactly where this fund trades.
 """
 
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -49,16 +64,14 @@ def _bucket(ts: float | None = None) -> str:
 def record(anchored: list[dict]) -> int:
     """Append this cycle's predictions, deduped by (market, 12h bucket)."""
     os.makedirs(ledger.STATE_DIR, exist_ok=True)
-    seen = set()
-    existing = {}
+    existing = set()
     if os.path.exists(PREDICTIONS):
         with open(PREDICTIONS) as fh:
             for line in fh:
                 try:
-                    e = json.loads(line)
+                    existing.add(json.loads(line).get("key"))
                 except json.JSONDecodeError:
                     continue
-                existing[e.get("key")] = e
 
     bucket = _bucket()
     rows, added = [], 0
@@ -68,7 +81,6 @@ def record(anchored: list[dict]) -> int:
         if p is None:
             continue
         key = f"{c['market_id']}@{bucket}"
-        seen.add(key)
         if key in existing:
             continue
         rows.append({
@@ -81,7 +93,7 @@ def record(anchored: list[dict]) -> int:
             "strike": c.get("strike"),
             "spot": f.get("spot"),
             "days_to_resolution": c.get("days_to_resolution"),
-            "p_trade": p,                      # the number the fund would trade on
+            "p_trade": p,
             "p_mid": f.get("p_mid"),
             "sigma_market": f.get("sigma_market_median"),
             "sigma_realized": f.get("sigma_realized"),
@@ -119,8 +131,7 @@ def score(limit: int = 400) -> dict:
     """Grade every unresolved prediction whose market has now resolved."""
     rows = _load()
     todo = [r for r in rows if not r.get("scored")][:limit]
-    graded = 0
-    by_key = {}
+    graded, by_key = 0, {}
     for r in todo:
         try:
             m = venue.settled_market(r["market_id"])
@@ -145,25 +156,24 @@ def score(limit: int = 400) -> dict:
         by_key[r["key"]] = r
 
     if graded:
-        merged = [by_key.get(r["key"], r) for r in rows]
         with open(PREDICTIONS, "w") as fh:
-            for r in merged:
+            for r in [by_key.get(x["key"], x) for x in rows]:
                 fh.write(json.dumps(r) + "\n")
     return {"graded": graded, "total": len(rows)}
 
 
-def summary() -> dict:
-    """Brier score, skill score and a reliability table."""
-    rows = [r for r in _load() if r.get("scored") and r.get("outcome") is not None]
+BUCKETS = [(0.0, 0.1), (0.1, 0.2), (0.2, 0.3), (0.3, 0.5),
+           (0.5, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.01)]
+
+
+def _stats(rows: list[dict]) -> dict:
     n = len(rows)
     if n == 0:
         return {"n": 0}
     brier = sum((r["p_trade"] - r["outcome"]) ** 2 for r in rows) / n
     base = sum((0.5 - r["outcome"]) ** 2 for r in rows) / n
-    buckets = [(0.0, 0.1), (0.1, 0.2), (0.2, 0.3), (0.3, 0.5),
-               (0.5, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.01)]
     rel = []
-    for lo, hi in buckets:
+    for lo, hi in BUCKETS:
         sel = [r for r in rows if lo <= r["p_trade"] < hi]
         if not sel:
             continue
@@ -182,30 +192,78 @@ def summary() -> dict:
     }
 
 
+def _one_per_market(rows: list[dict]) -> list[dict]:
+    """Latest forecast per distinct market — the independent sample."""
+    latest: dict[str, dict] = {}
+    for r in sorted(rows, key=lambda x: x.get("ts") or ""):
+        latest[r["market_id"]] = r
+    return list(latest.values())
+
+
+def summary() -> dict:
+    graded = [r for r in _load()
+              if r.get("scored") and r.get("outcome") is not None]
+    per_market = _one_per_market(graded)
+    return {
+        "all": _stats(graded),
+        "one_per_market": _stats(per_market),
+        "distinct_markets": len(per_market),
+        "pending": len([r for r in _load() if not r.get("scored")]),
+    }
+
+
+def verdict(s: dict) -> str:
+    """One line the LP can act on, deliberately blunt."""
+    m = s["one_per_market"]
+    if s["distinct_markets"] < 30:
+        return (f"NOT ENOUGH EVIDENCE — {s['distinct_markets']} distinct markets graded "
+                f"({s['pending']} pending). Do not draw conclusions yet.")
+    if m["skill"] <= 0:
+        return (f"MODEL FAILS — skill {m['skill']:+.4f} is no better than a coin flip "
+                f"over {m['n']} markets. Do not trade on p_trade until this is fixed.")
+    if m["skill"] < 0.05:
+        return (f"MARGINAL — skill {m['skill']:+.4f} over {m['n']} markets. Beats a coin "
+                f"flip but not by enough to overcome a 3-9% cost hurdle.")
+    return (f"MODEL HOLDS — skill {m['skill']:+.4f} over {m['n']} markets. "
+            f"Check the reliability table for tail bias before trusting size.")
+
+
 def render() -> str:
     s = summary()
-    out = ["CALIBRATION — is the model honest?", "=" * 68]
-    if s["n"] == 0:
+    out = ["CALIBRATION — is the model honest?", "=" * 72]
+    if s["distinct_markets"] == 0:
         out.append("  No graded predictions yet.")
-        pending = len([r for r in _load() if not r.get("scored")])
-        out.append(f"  Recorded, awaiting resolution: {pending}")
+        out.append(f"  Recorded, awaiting resolution: {s['pending']}")
+        out.append("")
+        out.append("  Meaning: nothing can be concluded. The recorder runs every")
+        out.append("  30 min, so this fills up as daily markets settle.")
         return "\n".join(out)
-    out.append(f"  graded predictions : {s['n']}")
-    out.append(f"  Brier score        : {s['brier']:.4f}   (0.25 = always saying 0.50)")
-    out.append(f"  skill vs coin flip : {s['skill']:+.4f}   "
-               f"({'better' if s['skill'] > 0 else 'WORSE'} than a coin flip)")
+
+    a, m = s["all"], s["one_per_market"]
+    out.append(f"  distinct markets graded : {s['distinct_markets']}")
+    out.append(f"  graded rows (correlated): {a['n']}")
+    out.append(f"  still pending           : {s['pending']}")
     out.append("")
+    out.append(f"  {'sample':<18} {'n':>5} {'Brier':>8} {'baseline':>9} {'skill':>8}")
+    for label, st in (("all predictions", a), ("one per market", m)):
+        out.append(f"  {label:<18} {st['n']:>5} {st['brier']:>8.4f} "
+                   f"{st['baseline_brier']:>9.4f} {st['skill']:>+8.4f}")
+    out.append("")
+    out.append("  RELIABILITY (one per market) — where the model lies")
     out.append(f"  {'bucket':>10} {'n':>5} {'predicted':>10} {'realized':>9} {'gap':>8}")
-    for r in s["reliability"]:
+    for r in m["reliability"]:
         gap = r["realized"] - r["predicted"]
-        flag = "  <- overconfident" if gap < -0.08 else ("  <- underconfident" if gap > 0.08 else "")
+        flag = "  overconfident" if gap < -0.08 else ("  underconfident" if gap > 0.08 else "")
         out.append(f"  {r['bucket']:>10} {r['n']:>5} {r['predicted']:>10.3f} "
                    f"{r['realized']:>9.3f} {gap:>+8.3f}{flag}")
-    out.append("=" * 68)
+    out.append("")
+    out.append("  VERDICT")
+    out.append("  " + verdict(s))
+    out.append("=" * 72)
     return "\n".join(out)
 
 
 if __name__ == "__main__":
-    if "--score" in os.sys.argv:
+    if "--score" in sys.argv:
         print(json.dumps(score(), indent=2))
     print(render())
