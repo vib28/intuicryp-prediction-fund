@@ -98,7 +98,7 @@ whether a cycle deserves a message.
                                             │
   2. FORECASTER  digital Φ(d2) / one-touch barrier  (realized vol)
                                             │
-     smile       invert each sibling strike's implied vol → median consensus
+     smile       build the strike ladder → least-squares σ across it
                  → re-price → p_trade  (the edge is now a strike dislocation,
                                         not a volatility opinion)
                                             │
@@ -253,24 +253,59 @@ market's forward vol**. That is a *volatility opinion*, not a mispricing. A $100
 account punting a vol view it cannot evidence gets destroyed slowly, and it will
 look like bad luck the whole way down.
 
-The fix is to stop using our own vol. Within one event there are ~11 strikes on
-the same underlying and expiry. `smile.py`:
-
-1. inverts each strike's ask to its **implied vol** (bisection),
-2. takes the **median** across siblings as the market's consensus vol for that
-   expiry,
-3. re-prices *every* strike against that consensus.
+The fix is to stop using our own vol. `smile.py` builds a **strike ladder** from
+every sibling in the same event (same underlying, same expiry) and fits a single
+least-squares σ across it, then re-prices every strike against that consensus.
 
 An edge now means exactly one thing: **this strike is mispriced relative to the
 vol curve its own siblings imply.** That is a testable dislocation rather than
-an opinion. The realized vol is still computed and reported as context, so the
+an opinion. Realized vol is still computed and reported as context, so the
 disagreement stays visible in the audit trail instead of hidden.
 
-The sanity signal that it works: on the one trade that briefly cleared the gate,
-`σ_market = 0.574` and `σ_realized = 0.541` sat close together — the model had
-stopped arguing with the market about vol and started finding strike-level
-mispricing instead. Events with fewer than 4 strikes from which to establish a
-consensus are skipped entirely rather than guessed at.
+### The ladder is U-shaped — and that killed the median
+
+Restoring the full ladder revealed the market's real structure. Implied vol per
+strike, BTC 2026-09-12, spot ≈ 77,377:
+
+| Strike | Ask | Implied vol |
+|---|---|---|
+| 70,000 | 0.999 | 0.678 |
+| 74,000 | 0.992 | 0.390 |
+| **78,000** | **0.180** | **0.186** |
+| 80,000 | 0.022 | 0.350 |
+| 84,000 | 0.002 | 0.606 |
+
+That is a **strongly U-shaped smile**: the market prices fatter tails than
+lognormal, so the near-money strike implies far *lower* vol than the wings.
+
+A **median** across those strikes returns **0.433**, which would price the
+near-money strike at 0.33 against an ask of 0.18 — a manufactured 0.15 edge,
+precisely the failure this module exists to prevent. So the consensus is a
+least-squares fit instead: a strike priced 0.998 barely moves as σ changes, so
+its squared error is nearly flat and it **down-weights itself**, while the
+near-money strike dominates. That is the right weighting, because near-money
+strikes are where the fund trades.
+
+Both values are stored (`sigma_market_median` = the fit,
+`sigma_market_median_raw` = the median) with `sigma_method` recorded in the
+forecast, so the choice is auditable rather than implicit.
+
+### Two traps that silently emptied the universe
+
+1. **The dead-zone filter must not remove strikes from the ladder.** Rejecting
+   near-certain strikes (ask ≥ 0.97) is right for *trading*, but doing it in the
+   Scout removed the very strikes the consensus needs. BTC strikes are $2,000
+   apart against ~1.6% daily vol, so only ~2 land inside a 0.02–0.97 band —
+   leaving groups of 2, below the 4-strike minimum. Every daily market was
+   discarded, and **the fund's highest-volume instruments were 100% excluded**
+   while it traded monthly barriers instead. Dead-zone strikes now stay in the
+   candidate set as curve *input* and are declined in `risk.py`.
+2. **Groups under 4 strikes are skipped**, never guessed at.
+
+Sanity signal that anchoring works: on the one trade that briefly cleared the
+gate, `σ_market = 0.574` and `σ_realized = 0.541` sat close together — the model
+had stopped arguing with the market about vol and started finding strike-level
+mispricing instead.
 
 ---
 
@@ -399,12 +434,27 @@ the real oracle outcome at settlement:
 a week yields hundreds of graded outcomes. A Telegram ping fires once per
 100-prediction threshold crossed.
 
+### Agent skills
+
+Both are versioned in `skills/` **and** installed on the box under
+`~/.hermes/skills/trading/`, so the Telegram bot answers them:
+
+| skill | what it does |
+|---|---|
+| **`calib`** | runs `calibration.py`, then explains the **meaning** and **implications**: the Brier/skill/reliability numbers, a blunt verdict (NOT ENOUGH EVIDENCE / MODEL FAILS / MARGINAL / MODEL HOLDS), and what each reliability gap implies for policy |
+| **`table`** | runs `table.py` — every trade with its prediction type, fees, PnL and the burn split |
+
+A predictor is only useful if you know when it is lying, so `calib` refuses to
+characterise the model below 30 distinct graded markets and says so.
+
 **Deployment:** the fund runs on a VPS at `/root/fund`. This repository is the
 source; the box is the runtime.
 
 ```bash
-scp *.py config.json run_cycle.sh root@<vps>:/root/fund/
+scp *.py config.json README.md run_cycle.sh root@<vps>:/root/fund/
 cp run_cycle.sh /root/.hermes/scripts/fund_cycle.sh   # cron requires this path
+scp skills/*/SKILL.md root@<vps>:/root/.hermes/skills/trading/<skill>/  # per skill
+systemctl --user restart hermes-gateway              # reload skills
 ```
 
 **Cron:** job `fund-cycle`, every 30 minutes, `--no-agent`, script
@@ -433,6 +483,9 @@ calibration.py  grades every prediction against its real outcome (Brier/skill)
 notify.py       decides whether a cycle deserves a message
 selftest.py     integrity harness, incl. auditor tamper detection
 run_cycle.sh    cron entrypoint (silent-unless-notable)
+skills/         agent skills shipped with the fund (versioned, not just on the box)
+  calib/        "is the model honest?" — Brier/skill/reliability + what to do
+  table/        the full trade table
 config.json     policy: capital, burn, limits, hurdles (reasoning inline)
 ```
 
@@ -460,11 +513,28 @@ returned **zero** priceable candidates out of 600 scanned. Discovery now merges
 three paths: explicit event slugs, public search, and the tag scan as a
 catch-all, deduped by market id.
 
-**4. Kelly and this mandate are incompatible.** A 1–2 point probability edge is
+**4. A filter that protected the wallet silently emptied the universe.** The
+dead-zone rule (don't trade near-certain strikes) was applied in the Scout, which
+removed the sibling strikes `smile.py` needs for a vol consensus — and because
+BTC strikes are $2,000 apart with ~1.6% daily vol, only ~2 per day fell inside
+the tradeable band. Groups of 2 < the 4-strike minimum, so **every daily market
+was discarded** and all 52 recorded predictions were long-dated monthly
+barriers. The fund's highest-volume instruments (~$560k/day) were 100% excluded,
+and nothing in the output said so. Fixed by separating "informs the curve" from
+"may be traded". Daily markets anchored: **0 → 18**.
+
+**5. Kelly and this mandate are incompatible.** A 1–2 point probability edge is
 real, and Kelly correctly says to bet $0.43 on it. Reported honestly rather than
 worked around by silently changing the sizing formula.
 
-**5. A green audit proves nothing until it can go red.** Hence the tamper test.
+**6. A green audit proves nothing until it can go red.** Hence the tamper test.
+
+**7. My own tooling lied twice while I was investigating #4.** A probe filtered
+slugs on the literal substring `above-on-`, but real slugs are
+`bitcoin-above-78k-on-...` — so it reported "zero daily markets discovered" when
+66 were being found. Separately, a hand-check of the least-squares fit concluded
+it was broken; the arithmetic was wrong, not the code. Both times the fix was to
+measure the actual value rather than reason about it.
 
 ---
 
@@ -490,10 +560,12 @@ Stated rather than buried:
 
 1. Kalshi as a second reference price — a genuine cross-venue dislocation signal.
 2. Maker-order modelling, to earn the rebate rather than pay the taker fee.
-3. Per-event vol-smile fitting (currently a median) to detect skew, not just
-   level.
-4. Calibration tracking: record `p_trade` against realized outcomes, so the
-   model's own bias becomes measurable over time.
+3. Per-event vol-smile **skew** modelling — the ladder fit is a single σ, but the
+   measured smile is U-shaped, so a two-parameter (level + curvature) fit would
+   describe it better than one number.
+4. Act on calibration once the sample is large enough — the recorder is running
+   (`calibration.py`), but the reliability table is only actionable past ~30
+   graded markets.
 
 ---
 
