@@ -136,6 +136,13 @@ def scan(cfg: dict) -> tuple[list[dict], list[dict]]:
     markets = discover(cfg)
     candidates, rejections = [], []
 
+    # Cadence invariant, stated rather than magic-numbered: never hold a market
+    # whose remaining life is shorter than a multiple of the scan interval, or
+    # the fund is holding something it cannot observe between ticks.
+    cadence_days = cfg["scan"]["interval_minutes"] / 1440.0
+    multiple = cfg["scan"].get("horizon_cadence_multiple", 6)
+    min_horizon = max(u["min_days_to_resolution"], cadence_days * multiple)
+
     for m in markets:
         slug = m.get("slug") or ""
         q = m.get("question") or ""
@@ -155,8 +162,8 @@ def scan(cfg: dict) -> tuple[list[dict], list[dict]]:
             reject("not_accepting_orders"); continue
         if vol24 < u["min_volume_24h_usd"]:
             reject("volume_below_floor", vol24=round(vol24)); continue
-        if dtr is None or dtr < u["min_days_to_resolution"] or dtr > u["max_days_to_resolution"]:
-            reject("horizon_out_of_range",
+        if dtr is None or dtr < min_horizon or dtr > u["max_days_to_resolution"]:
+            reject("horizon_out_of_range", min_horizon_days=round(min_horizon, 4),
                    days=round(dtr, 2) if dtr is not None else None); continue
 
         tokens = venue.market_tokens(m)

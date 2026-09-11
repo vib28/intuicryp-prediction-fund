@@ -17,6 +17,7 @@ import os
 import sys
 
 import auditor
+import calibration
 import forecaster
 import ledger
 import risk
@@ -83,6 +84,11 @@ def run(dry_run: bool = False) -> dict:
     approved, risk_rejects = risk.evaluate(anchored, cfg)
     booked = [] if dry_run else risk.execute(approved, cfg, dry_run=dry_run)
 
+    # Calibration runs on EVERY priced market, traded or not. The fund may take
+    # no trades for weeks; that must not also mean no evidence about the model.
+    recorded = calibration.record(anchored)
+    graded = calibration.score() if not dry_run else {"graded": 0}
+
     audit = auditor.audit(cfg)
     totals = ledger.totals()
 
@@ -101,7 +107,10 @@ def run(dry_run: bool = False) -> dict:
             "approved": len(approved),
             "risk_rejected": len(risk_rejects),
             "booked": len(booked),
+            "predictions_recorded": recorded,
+            "predictions_graded": graded.get("graded", 0),
         },
+        "calibration": calibration.summary(),
         "top_approved": [
             {"slug": a["slug"], "ev_on_stake_pct": round(a["edge"]["ev_on_stake_pct"], 2),
              "edge_prob": round(a["edge"]["edge_prob"], 4),

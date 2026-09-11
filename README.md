@@ -383,6 +383,22 @@ strike, entry, exit-or-live-mark, stake, fee, PnL $ and %, plus totals for
 realized/unrealized/net P&L, fees paid, and the burn split into
 $10 tokens + $5 VPS. It is wired to the Telegram bot via the `table` skill.
 
+**`calibration.py`** is how we find out whether the model is any good without
+risking money. The fund may take no trades for weeks, and "we found no edge" is
+otherwise indistinguishable from "the model is broken". So every cycle records a
+prediction for **every priced market — traded or not** — and grades it against
+the real oracle outcome at settlement:
+
+| metric | meaning |
+|---|---|
+| Brier score | mean squared error of the probabilities; 0.25 = always saying 0.50 |
+| skill score | `1 − Brier/0.25`; positive means better than a coin flip |
+| reliability | bucketed predicted vs realized frequency — exposes over/under-confidence, which is exactly what matters in the tails we trade |
+
+~51 predictions are recorded per cycle (deduped to one per market per 12h), so
+a week yields hundreds of graded outcomes. A Telegram ping fires once per
+100-prediction threshold crossed.
+
 **Deployment:** the fund runs on a VPS at `/root/fund`. This repository is the
 source; the box is the runtime.
 
@@ -413,6 +429,7 @@ ledger.py       append-only ledger, burn accrual, settlement (no exit path)
 cycle.py        orchestration of the four agents
 report.py       economics + live state
 table.py        the full trade table: type, PnL, fees, burn split
+calibration.py  grades every prediction against its real outcome (Brier/skill)
 notify.py       decides whether a cycle deserves a message
 selftest.py     integrity harness, incl. auditor tamper detection
 run_cycle.sh    cron entrypoint (silent-unless-notable)

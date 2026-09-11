@@ -117,3 +117,8 @@ if __name__ == "__main__":
     cfg = json.load(open(os.path.join(HERE, "config.json")))
     economics(cfg)
     state(cfg)
+    try:
+        import calibration
+        print(calibration.render())
+    except Exception as exc:                            # noqa: BLE001
+        print(f"(calibration unavailable: {exc})")

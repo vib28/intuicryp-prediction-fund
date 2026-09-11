@@ -40,6 +40,29 @@ def main() -> int:
         emoji = "🛑" if mode == "dead" else "⚠️"
         msgs.append(f"{emoji} SURVIVAL MODE: {mode.upper()}")
 
+    # First real calibration signal: the model may take no trades for weeks, so
+    # the moment we have enough graded predictions to say whether the
+    # probabilities are honest, say so. Announced once per threshold.
+    try:
+        cal = d.get("calibration") or {}
+        n = int(cal.get("n") or 0)
+        if n >= 50:
+            marker = os.path.join(HERE, "state", ".calibration_announced")
+            announced = 0
+            if os.path.exists(marker):
+                announced = int(open(marker).read().strip() or 0)
+            bucket = (n // 100) * 100
+            if bucket > announced:
+                with open(marker, "w") as fh:
+                    fh.write(str(bucket))
+                skill = cal.get("skill", 0.0)
+                msgs.append(f"📊 CALIBRATION: {n} graded predictions — "
+                            f"Brier {cal.get('brier', 0):.4f}, "
+                            f"skill vs coin flip {skill:+.4f} "
+                            f"({'better' if skill > 0 else 'WORSE'})")
+    except Exception:                                   # noqa: BLE001
+        pass
+
     if not msgs:
         return 0                              # silent: nothing happened
 

@@ -84,7 +84,7 @@ def _prob(family: str, spot: float, strike: float, sigma: float, years: float) -
     return float("nan")
 
 
-def forecast(candidate: dict, vol_window_bars: int = 168) -> dict:
+def forecast(candidate: dict, vol_window_bars: int | None = None) -> dict:
     symbol = candidate["symbol"]
     strike = float(candidate["strike"])
     family = candidate["family"]
@@ -95,8 +95,17 @@ def forecast(candidate: dict, vol_window_bars: int = 168) -> dict:
     except Exception as exc:                           # noqa: BLE001
         return {"ok": False, "reason": f"spot_unavailable: {str(exc)[:60]}"}
 
+    # Horizon-matched vol: interval AND lookback are chosen from how long the
+    # market has left to live, and recent returns are weighted more heavily
+    # (EWMA) because vol clusters. `vol_window_bars` is an explicit override for
+    # tests; production lets the horizon decide.
+    interval, bars = venue.vol_plan_for_horizon(years * 365.0)
+    if vol_window_bars is not None:
+        bars = vol_window_bars
+    halflife = max(2.0, bars / 3.0)
+
     try:
-        vol = venue.realized_vol(symbol, "1h", vol_window_bars)
+        vol = venue.realized_vol(symbol, interval, bars, ewma_halflife=halflife)
     except Exception as exc:                           # noqa: BLE001
         return {"ok": False, "reason": f"vol_unavailable: {str(exc)[:60]}"}
 
@@ -127,6 +136,9 @@ def forecast(candidate: dict, vol_window_bars: int = 168) -> dict:
         "years": years,
         "days": years * 365.0,
         "sigma_annual": sigma,
+        "vol_interval": interval,
+        "vol_bars": bars,
+        "vol_weighting": vol.get("weighting"),
         "realized_bars": vol["bars"],
         "realized_samples": vol["samples"],
         "p_mid": p_mid,
@@ -134,7 +146,8 @@ def forecast(candidate: dict, vol_window_bars: int = 168) -> dict:
         "p_high_vol": p_high,
         "p_conservative": p_conservative,
         "moneyness_pct": 100.0 * (spot - strike) / spot,
-        "method": f"{family}: driftless lognormal, realized vol (Binance 1h, {vol_window_bars} bars)",
+        "method": (f"{family}: driftless lognormal, "
+                   f"{vol.get('weighting')} realized vol (Binance {interval} x {bars})"),
         "model_risk": "realized vol is backward-looking; sigma band is a crude error proxy",
     }
 

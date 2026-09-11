@@ -19,6 +19,29 @@ GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 BINANCE = "https://api.binance.com"
 
+# Horizon-matched volatility. A 7-day window of hourly bars is the WRONG input
+# for a market resolving in 15 minutes: vol clusters, so recent data must
+# dominate, and the sample must span the horizon being priced. We pick the
+# kline interval AND the lookback from the market's own time-to-resolution.
+VOL_PLAN = [
+    # (max minutes to resolution, interval, lookback bars)
+    (120,          "1m",  1440),   # <= 2h   -> last day of 1m bars
+    (1440,         "15m",  288),   # <= 24h  -> last 3 days of 15m bars
+    (10080,        "1h",   168),   # <= 7d   -> last week of hourly bars
+    (float("inf"), "4h",   168),   # longer  -> last month of 4h bars
+]
+
+PER_YEAR = {"1m": 525600, "5m": 105120, "15m": 35040, "1h": 8760, "4h": 2190, "1d": 365}
+
+
+def vol_plan_for_horizon(days: float) -> tuple[str, int]:
+    """(interval, lookback) matched to how long the market has left to live."""
+    mins = max(0.0, days) * 1440.0
+    for limit, interval, lookback in VOL_PLAN:
+        if mins <= limit:
+            return interval, lookback
+    return "4h", 168
+
 # Crypto-related Gamma tag ids (verified live): crypto=21, bitcoin=235,
 # ethereum=39. We scan the crypto tag and keep price-threshold markets.
 CRYPTO_TAG = 21
@@ -124,11 +147,13 @@ def spot(symbol: str = "BTCUSDT") -> float:
 
 
 def realized_vol(symbol: str = "BTCUSDT", interval: str = "1h",
-                 lookback: int = 168) -> dict:
+                 lookback: int = 168, ewma_halflife: float | None = None) -> dict:
     """Annualised realized volatility from log returns.
 
-    `lookback` controls the window; 168 hourly bars = 7 days. We report the
-    sample size so the forecaster can refuse to price on a thin sample.
+    `ewma_halflife` (in bars) weights recent returns more heavily, which
+    matters at short horizons where vol clustering dominates the estimate.
+    We report the sample size so the forecaster can refuse to price on a thin
+    sample.
     """
     kl = _get_json(
         f"{BINANCE}/api/v3/klines?"
@@ -144,9 +169,16 @@ def realized_vol(symbol: str = "BTCUSDT", interval: str = "1h",
     ]
     n = len(rets)
     mean = sum(rets) / n
-    var = sum((r - mean) ** 2 for r in rets) / (n - 1) if n > 1 else 0.0
+    if ewma_halflife and ewma_halflife > 0:
+        # Exponential weights, newest bar last, halving every `ewma_halflife`.
+        weights = [0.5 ** ((n - 1 - i) / ewma_halflife) for i in range(n)]
+        wsum = sum(weights)
+        wmean = sum(w * r for w, r in zip(weights, rets)) / wsum
+        var = sum(w * (r - wmean) ** 2 for w, r in zip(weights, rets)) / wsum
+    else:
+        var = sum((r - mean) ** 2 for r in rets) / (n - 1) if n > 1 else 0.0
     sd = var ** 0.5
-    per_year = {"1m": 525600, "5m": 105120, "15m": 35040, "1h": 8760, "1d": 365}[interval]
+    per_year = PER_YEAR.get(interval, 8760)
     return {
         "ok": True,
         "report_vol": sd * (per_year ** 0.5),
@@ -154,4 +186,5 @@ def realized_vol(symbol: str = "BTCUSDT", interval: str = "1h",
         "bars": len(closes),
         "interval": interval,
         "samples": n,
+        "weighting": f"ewma(halflife={ewma_halflife})" if ewma_halflife else "flat",
     }

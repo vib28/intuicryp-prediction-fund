@@ -18,6 +18,7 @@
   "scan": {
     "pages": 6,
     "interval_minutes": 30,
+    "horizon_cadence_multiple": 6,
     "rejections_max_bytes": 5000000,
     "daily_assets": ["bitcoin", "ethereum"],
     "daily_days_ahead": 3,
