@@ -105,12 +105,77 @@ def accrue_burn(apply: bool = True) -> float:
     return amount
 
 
+def _recompute(pos: dict) -> dict:
+    """Derive a position's aggregates from its fills.
+
+    On Polymarket there is ONE net balance per outcome token: repeat orders
+    merge into a single position with a blended cost basis. They are not
+    separate tickets, so the ledger must not model them as separate positions —
+    otherwise the exposure caps apply per fill instead of per market, and two
+    fills silently become a 2x bet on one oracle call.
+    """
+    fills = pos.get("fills") or []
+    if not fills:
+        return pos
+    tot_shares = sum(float(f["shares"]) for f in fills)
+    tot_allin = sum(float(f["all_in_usd"]) for f in fills)
+    tot_fee = sum(float(f["fee_usd"]) for f in fills)
+    tot_gross = sum(float(f["shares"]) * float(f["vwap"]) for f in fills)
+    pos["shares"] = tot_shares
+    pos["all_in_usd"] = tot_allin
+    pos["fee_usd"] = tot_fee
+    pos["vwap"] = tot_gross / tot_shares if tot_shares else 0.0
+    pos["cost_per_share"] = tot_allin / tot_shares if tot_shares else 0.0
+    weights = sum(float(f["shares"]) for f in fills) or 1.0
+    pos["model_prob"] = sum(float(f.get("model_prob") or 0.0) * float(f["shares"])
+                            for f in fills) / weights
+    return pos
+
+
+def fill_count(pos: dict) -> int:
+    return len(pos.get("fills") or []) or 1
+
+
 def open_position(*, market: dict, token_id: str, outcome: str, fill,
                   model_prob: float, forecast: dict, snapshot_path: str) -> dict:
-    """Book a paper fill. Cash leaves the account at the ALL-IN cost."""
+    """Book a paper fill, MERGING into an existing position for the same market.
+
+    Cash leaves the account at the all-in cost either way. If the market is
+    already held, the fill is appended to that position's `fills` and the
+    aggregates (shares, blended cost basis, total fee) are recomputed — which is
+    what the venue itself does with a repeat order.
+    """
     acct = load_json(ACCOUNT, {})
     acct["cash_usd"] = float(acct.get("cash_usd", STARTING_EQ)) - fill.all_in_usd
     save_json(ACCOUNT, acct)
+
+    entry = {
+        "ts": now_iso(),
+        "shares": fill.shares,
+        "vwap": fill.vwap,
+        "all_in_usd": fill.all_in_usd,
+        "fee_usd": fill.fee_usd,
+        "stake_usd": fill.gross_usd,
+        "levels_used": fill.levels_used,
+        "book_depth_usd": fill.book_depth_usd,
+        "model_prob": model_prob,
+        "snapshot": snapshot_path,
+    }
+
+    state = load_json(POSITIONS, {"positions": []})
+    existing = next((p for p in state["positions"]
+                     if p.get("status") == "open"
+                     and str(p.get("market_id")) == str(market.get("id"))), None)
+
+    if existing is not None:
+        existing.setdefault("fills", []).append(entry)
+        _recompute(existing)
+        save_json(POSITIONS, state)
+        append_event("add", id=existing["id"], market_id=existing["market_id"],
+                     slug=existing.get("slug"), shares=entry["shares"],
+                     all_in_usd=entry["all_in_usd"], fee_usd=entry["fee_usd"],
+                     fills=len(existing["fills"]))
+        return existing
 
     pos = {
         "id": f"pos-{int(time.time()*1000)}",
@@ -121,19 +186,11 @@ def open_position(*, market: dict, token_id: str, outcome: str, fill,
         "token_id": token_id,
         "outcome": outcome,
         "end_date": market.get("endDate"),
-        "shares": fill.shares,
-        "vwap": fill.vwap,
-        "cost_per_share": fill.cost_per_share,
-        "all_in_usd": fill.all_in_usd,
-        "fee_usd": fill.fee_usd,
-        "levels_used": fill.levels_used,
-        "book_depth_usd": fill.book_depth_usd,
-        "model_prob": model_prob,
+        "fills": [entry],
         "forecast": forecast,
-        "snapshot": snapshot_path,
         "status": "open",
     }
-    state = load_json(POSITIONS, {"positions": []})
+    _recompute(pos)
     state["positions"].append(pos)
     save_json(POSITIONS, state)
     append_event("open", **{k: pos[k] for k in

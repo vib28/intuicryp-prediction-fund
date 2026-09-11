@@ -123,7 +123,8 @@ def run(dry_run: bool = False) -> dict:
         "survival_mode": risk.survival_mode(totals["equity_usd"], cfg),
         "totals": totals,
         "audit": {"passed": audit["passed"], "checks": audit["checks"],
-                  "findings": len(audit["findings"])},
+                  "findings": len(audit["findings"]),
+                  "warnings": len(audit.get("warnings") or [])},
     }
     os.makedirs(os.path.dirname(LAST_CYCLE), exist_ok=True)
     with open(LAST_CYCLE, "w") as fh:

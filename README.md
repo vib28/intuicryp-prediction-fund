@@ -32,6 +32,7 @@ A four-agent **paper-trading fund** on Polymarket crypto markets.
 - [Settlement](#settlement)
 - [How the audit works](#how-the-audit-works)
 - [State and ledger design](#state-and-ledger-design)
+- [The learning loop](#the-learning-loop)
 - [Running it](#running-it)
 - [Repository layout](#repository-layout)
 - [Build log: findings that changed the design](#build-log-findings-that-changed-the-design)
@@ -535,6 +536,155 @@ slugs on the literal substring `above-on-`, but real slugs are
 66 were being found. Separately, a hand-check of the least-squares fit concluded
 it was broken; the arithmetic was wrong, not the code. Both times the fix was to
 measure the actual value rather than reason about it.
+
+---
+
+## The learning loop
+
+### Do we have one? No.
+
+The fund **measures** but does not **adapt**. There is a feedback instrument with
+no closure:
+
+| component | what it does | learns? |
+|---|---|---|
+| `calibration.py` | grades every prediction against the real outcome | **No** — nothing consumes the result |
+| `smile.py` | fits σ across the event's strike ladder | **No** — refits from scratch each cycle, retains nothing |
+| `forecaster.py` | digital + one-touch barrier pricing | **No** — no parameter is fitted from outcomes |
+| `risk.py` | hurdle, sizing, caps | **No** — every threshold is a constant in `config.json` |
+| `scout.py` | universe filters | **No** — constants |
+
+Everything learnable is currently a hand-set constant. That is a gap, not a
+design choice, and it is worth saying plainly: **the fund cannot get better at
+trading on its own.**
+
+### The predecessor had a loop, and it failed in a specific way
+
+The retired spot stack *did* learn: `reflect.py` rewrote `pair.yaml` variables
+every ~5 applied trades (`entry.threshold`, `stop_loss_pct`,
+`atr_stop_multiplier`, …). Its failure modes are the default failure modes of any
+naive loop, and they are the requirements for the next one:
+
+- it applied **no-ops** — `entry.threshold 50 -> 50` — and reported them as
+  progress;
+- it was limited to **one whitelisted knob per cycle**, so it tuned *exits* while
+  the actual defect was the *entry signal*;
+- and critically, **it never measured whether its own changes helped, and never
+  reverted one.** Every change was permanent.
+
+That last point is the whole lesson. Adaptation without accountability is not
+learning, it is motion — and it produces a system that sounds like it is
+improving while it drifts.
+
+### Where the feedback must come from: not P&L
+
+At $100 scale trade P&L is a hopeless learning signal. Per-trade returns from a
+binary are enormously dispersed, so resolving a real edge against the noise
+needs an unattainable number of observations:
+
+| true edge per trade | trades needed to prove it (95%) |
+|---|---|
+| **7.1%** | **2,017** |
+| 17.9% | 340 |
+| 42.9% | 64 |
+
+At the ~1 trade/day the fund actually sees, the first row is **5.5 years**.
+
+Calibration needs far less, because it never asks "did we make money" — only
+"when we said 0.25, did it happen 0.25 of the time":
+
+| mis-calibration to detect | graded predictions needed |
+|---|---|
+| 0.15 | 32 |
+| 0.10 | 72 |
+| **0.08** | **113** |
+| 0.05 | 288 |
+
+And those samples arrive fast: ~51 markets are priced per cycle, deduped to one
+prediction per market per 12h, giving roughly **50–100 graded predictions per
+day** once markets are resolving (~350–700/week).
+
+So: **~113 samples arriving at ~100/day, versus ~2,017 samples arriving at
+~1/day.** In wall-clock terms, days against years — about three orders of
+magnitude. Any learning loop at this fund must be built on calibration.
+
+### The plan
+
+**Layer 0 — a frozen baseline (prerequisite).**
+Version every parameter set and keep an untouched copy of the model. No change
+counts as an improvement without an out-of-sample comparison against that frozen
+original. Without it nothing is attributable, and the loop is unfalsifiable.
+
+**Layer 1 — probability calibration (fast, high-N).**
+Fit a monotone map `p_cal = f(p_raw)` on graded predictions (isotonic regression,
+or a coarse bucketed/Platt correction) and trade `p_cal` in place of `p_trade`.
+Guards: shrink toward the identity when a bucket's N is small; never extrapolate
+outside the observed range; refit on a schedule (weekly) rather than continuously
+so policy is stable and each change is a recorded event; revert if reliability
+worsens after a refit.
+
+This is the highest-value layer. It corrects exactly the failure mode that
+matters — over-confidence in the 0.0–0.3 buckets, where every position lives —
+and it raises the *effective* hurdle in precisely the buckets where the model is
+lying.
+
+**Layer 2 — model structure (medium, needs no capital).**
+Fit quality is measurable immediately, without waiting for outcomes. Compare
+competing structures on held-out fit residuals — e.g. the single-σ ladder fit
+versus a two-parameter (level + curvature) smile, which the measured U-shape
+suggests is warranted. Adopt only if residuals improve on a day the model was
+*not* fitted on.
+
+**Layer 3 — policy (slow, low-N, last).**
+Only the hurdle and sizing should ever adapt, and only once trade N is large
+enough that the P&L table above means something. Adapt from **calibrated** EV,
+never raw; never loosen the hurdle on a win streak (that is fitting luck); move in
+bounded steps and record the expected effect each time.
+
+**Layer 4 — the market itself (data already collected, unexploited).**
+Every prediction stores both `sigma_market` (the fit) and `sigma_realized`. The
+gap between them is the variance risk premium — measurable now, with no capital
+and no loop, and the most likely place a genuine non-directional edge exists in
+this market.
+
+### Governance rules
+
+1. **One change per cycle**, written as a hypothesis: the change, the metric it
+   should move, and by how much. No bundling.
+2. **Every change is falsifiable and revertible.** Record the prediction, measure
+   it later, revert if it does not materialise. The predecessor never reverted
+   anything; that is the bug not to repeat.
+3. **Bounds on every learned parameter**, with human-only knobs — venue, trading
+   direction, capital, and the cost model itself — permanently outside the loop.
+4. **A frozen baseline and an out-of-sample gate** on every adoption.
+5. **A kill switch:** on calibration degradation, revert automatically to the last
+   known-good parameter set.
+6. **No LLM inside the loop.** Deterministic code only. An LLM reasoning about
+   whether the fund is doing well cannot be audited the way a recomputed fill can
+   be, and the auditor's independence is this system's main defence.
+
+### What I would not build
+
+- **Learning from P&L at this scale** — the power table is the reason.
+- **LLM-written strategy rewrites** — unauditable, and at 1–2 trades logged it
+  would be fitting noise.
+- **Touching the cost hurdle before calibration is trustworthy** — calibration and
+  the cost hurdle are independent questions, and conflating them would let a
+  modelling fix masquerade as a policy improvement.
+
+### Build order
+
+```
+1. freeze baseline + version parameter sets      prerequisite; no learning yet
+2. layer 1  probability calibration              highest power, days to validate
+3. layer 2  smile structure (level + curvature)  no capital, immediate feedback
+4. layer 4  variance risk premium                data already being collected
+5. layer 3  policy adaptation                    only at sufficient trade N
+```
+
+Explicitly: **step 1 is not worth starting until calibration holds ~30+ graded
+distinct markets**, because below that a loop would be fitting noise — which is
+precisely the failure the predecessor shipped.
 
 ---
 

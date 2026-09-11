@@ -124,7 +124,7 @@ def main() -> int:
         check("auditor PASSES honest book", res["passed"], f"findings={len(res['findings'])}")
 
         # ---- 5. auditor catches tampering  (the integrity check that matters)
-        snap = pos["snapshot"]
+        snap = (pos.get("fills") or [{}])[0].get("snapshot") or pos.get("snapshot")
         with open(snap) as fh:
             data = json.load(fh)
         data["fill_as_booked"]["shares"] *= 1.5          # steal shares

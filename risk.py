@@ -121,10 +121,23 @@ def execute(approved: list[dict], cfg: dict, dry_run: bool = False) -> list[dict
     if mode != "normal":
         return [{"skipped": True, "reason": f"survival_mode:{mode}"}]
 
+    # Concurrency counts DISTINCT MARKETS, not fills. A repeat order on a market
+    # already held merges into that position (ledger.open_position), so it takes
+    # no extra slot — but the TOTAL exposure to that market is capped, which is
+    # what the per-position limit should have meant all along. Polymarket has one
+    # net balance per outcome token; there is no second ticket to block.
+    open_by_market = {str(p.get("market_id")): p for p in ledger.open_positions()}
+    cap_abs = cfg["risk"]["absolute_max_position_usd"]
+
     for row in approved:
-        if len(ledger.open_positions()) >= max_concurrent:
+        mid = str(row["market_id"])
+        held_pos = open_by_market.get(mid)
+        if held_pos is None and len(open_by_market) >= max_concurrent:
             break
         stake = size(row, ledger.totals(), cfg)
+        if held_pos is not None:
+            room = cap_abs - float(held_pos.get("all_in_usd") or 0.0)
+            stake = min(stake, max(0.0, room))       # top up only within the cap
         if stake < cfg["risk"]["min_position_usd"]:
             continue
 
