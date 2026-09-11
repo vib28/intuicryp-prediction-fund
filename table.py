@@ -1,9 +1,9 @@
 """
 Table — the full trade table, with costs and burn, in one view.
 
-Answers "table" with every trade the fund has taken (open and settled),
-what KIND of prediction each was, what it cost in fees, and what it cost to
-run — because a P&L that ignores the burn is fiction.
+Answers "table" with every trade the fund has taken (open and settled), what
+KIND of prediction each was, what it cost in fees, and what it cost to run —
+because a P&L that ignores the burn is fiction.
 
 Renders:
   1. capital / burn / target header
@@ -11,23 +11,24 @@ Renders:
   3. totals: realized, unrealized, net, fees paid, burn charged (split tokens/VPS)
   4. burn breakdown and runway
 
-Open positions are marked to the live book midpoint when it can be fetched;
-if not, they fall back to cost basis (no paper profit is claimed on a guess).
+Open positions are marked to the live book midpoint when it can be fetched; if
+not, they fall back to cost basis (no paper profit is claimed on a guess).
+
+Every policy number (burn, capital, target) is read from config.py. This module
+used to carry its own copies of the burn constants, which is exactly how a
+"burn charged" figure drifts away from the burn the ledger actually deducted.
 """
 
-import json
 import os
 import sys
+from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import ledger      # noqa: E402
-import venue       # noqa: E402
-
-BURN_WEEKLY = 15.0
-BURN_TOKENS_WEEKLY = 10.0
-BURN_VPS_WEEKLY = 5.0
+import config     # noqa: E402
+import ledger     # noqa: E402
+import venue      # noqa: E402
 
 
 def horizon_bucket(days: float | None) -> str:
@@ -62,7 +63,6 @@ def market_type(pos: dict) -> str:
     family = f.get("family") or pos.get("family") or "?"
     days = f.get("days")
     if days is None and pos.get("end_date") and pos.get("opened"):
-        from datetime import datetime
         try:
             end = datetime.fromisoformat(pos["end_date"].replace("Z", "+00:00"))
             op = datetime.fromisoformat(pos["opened"])
@@ -74,44 +74,45 @@ def market_type(pos: dict) -> str:
 
 def mark(pos: dict) -> float | None:
     """Live midpoint for an open position, or None if unavailable."""
-    tok = pos.get("token_id")
-    if not tok:
+    token = pos.get("token_id")
+    if not token:
         return None
     try:
-        book = venue.order_book(tok)
-        bid, ask = venue.best_bid_ask(book)
-        if bid is None or ask is None:
-            return None
-        return 0.5 * (bid + ask)
+        bid, ask = venue.best_bid_ask(venue.order_book(token))
     except Exception:                              # noqa: BLE001
         return None
+    if bid is None or ask is None:
+        return None
+    return 0.5 * (bid + ask)
 
 
 def build() -> dict:
     acct = ledger.load_json(ledger.ACCOUNT, {})
     positions = sorted(ledger.all_positions(), key=lambda p: p.get("opened") or "")
+    burn_weekly = config.burn_total_weekly()
+    burn_tokens_share, burn_vps_share = config.burn_split()
+
     rows = []
     real = unreal = fees = 0.0
-
     for i, p in enumerate(positions, 1):
         stake = float(p.get("all_in_usd") or 0)
         fee = float(p.get("fee_usd") or 0)
         fees += fee
-        settled = p.get("status") == "settled"
-        if settled:
+
+        if p.get("status") == "settled":
             pnl = float(p.get("pnl_usd") or 0)
             real += pnl
-            exit_disp = f"{p.get('payout_usd', 0) / float(p['shares']):.4f}" if p.get("shares") else "-"
             exit_disp = "1.0000" if p.get("won") else "0.0000"
             status = "WIN" if p.get("won") else "LOSS"
         else:
-            m = mark(p)
-            entry = float(p.get("cost_per_share") or 0)
+            mid = mark(p)
             shares = float(p.get("shares") or 0)
-            pnl = (m - entry) * shares if m is not None else 0.0
+            entry = float(p.get("cost_per_share") or 0)
+            pnl = (mid - entry) * shares if mid is not None else 0.0
             unreal += pnl
-            exit_disp = f"{m:.4f}" if m is not None else "n/a"
+            exit_disp = f"{mid:.4f}" if mid is not None else "n/a"
             status = "open"
+
         rows.append({
             "n": i,
             "type": market_type(p),
@@ -135,35 +136,45 @@ def build() -> dict:
         "unrealized": unreal,
         "fees": fees,
         "burn": burn,
-        "burn_tokens": burn * (BURN_TOKENS_WEEKLY / BURN_WEEKLY),
-        "burn_vps": burn * (BURN_VPS_WEEKLY / BURN_WEEKLY),
+        "burn_tokens": burn * burn_tokens_share,
+        "burn_vps": burn * burn_vps_share,
+        "burn_weekly": burn_weekly,
+        "burn_tokens_weekly": config.burn_tokens_weekly(),
+        "burn_vps_weekly": config.burn_vps_weekly(),
         "equity": equity,
-        "start": float(acct.get("starting_equity_usd", ledger.STARTING_EQ)),
+        "start": float(acct.get("starting_equity_usd", config.capital())),
+        "target": config.target(),
+        "name": config.load()["fund"]["name"],
         "trades": len(positions),
         "wins": sum(1 for p in positions if p.get("status") == "settled" and p.get("won")),
         "losses": sum(1 for p in positions if p.get("status") == "settled" and not p.get("won")),
         "open_count": len(ledger.open_positions()),
+        "fills": sum(len(p.get("fills") or []) or 1 for p in positions),
     }
 
 
 def render(d: dict) -> str:
     out = []
     net = d["realized"] + d["unrealized"]
-    out.append("FUND TABLE — IntuiCryp Prediction Fund")
+    pct = 100.0 * (d["equity"] - d["start"]) / d["start"] if d["start"] else 0.0
+    out.append(f"FUND TABLE — {d['name']}")
     out.append("=" * 100)
     out.append(f"CAPITAL   start ${d['start']:.2f}   equity ${d['equity']:.4f}   "
-               f"net {d['equity'] - d['start']:+.4f} ({100*(d['equity']-d['start'])/d['start']:+.2f}%)")
-    out.append(f"BURN      ${BURN_WEEKLY:.2f}/wk = ${BURN_TOKENS_WEEKLY:.2f} tokens + ${BURN_VPS_WEEKLY:.2f} VPS"
-               f"   charged so far ${d['burn']:.4f} "
+               f"net {d['equity'] - d['start']:+.4f} ({pct:+.2f}%)")
+    out.append(f"BURN      ${d['burn_weekly']:.2f}/wk = ${d['burn_tokens_weekly']:.2f} tokens "
+               f"+ ${d['burn_vps_weekly']:.2f} VPS   charged so far ${d['burn']:.4f} "
                f"(${d['burn_tokens']:.4f} tokens + ${d['burn_vps']:.4f} VPS)")
-    runway = (d["equity"] / BURN_WEEKLY) if BURN_WEEKLY else float("inf")
-    out.append(f"TARGET    $1,000 (10x)   runway at zero edge: {runway:.1f} weeks")
+    runway = (d["equity"] / d["burn_weekly"]) if d["burn_weekly"] else float("inf")
+    multiple = d["target"] / d["start"] if d["start"] else 0.0
+    out.append(f"TARGET    ${d['target']:,.0f} ({multiple:.0f}x)   "
+               f"runway at zero edge: {runway:.1f} weeks")
     out.append("")
 
     if not d["rows"]:
         out.append("TRADES    none yet — no dislocation has cleared the cost hurdle.")
     else:
-        out.append(f"TRADES ({d['trades']}: {d['open_count']} open, {d['wins']}W/{d['losses']}L settled)")
+        out.append(f"TRADES ({d['trades']}: {d['open_count']} open, "
+                   f"{d['fills']} fills, {d['wins']}W/{d['losses']}L settled)")
         out.append(f"{'#':>2} {'opened':16} {'prediction type':22} {'market':34} "
                    f"{'strike':>9} {'entry':>6} {'exit':>7} {'stake':>7} {'fee':>7} "
                    f"{'pnl $':>9} {'pnl %':>8} {'status':>6}")
@@ -178,8 +189,10 @@ def render(d: dict) -> str:
     out.append(f"  realized PnL        ${d['realized']:+.4f}")
     out.append(f"  unrealized PnL      ${d['unrealized']:+.4f}")
     out.append(f"  NET P&L             ${net:+.4f}")
-    out.append(f"  fees paid (venue)   ${d['fees']:.4f}  ({100*d['fees']/d['equity']:.3f}% of equity)")
-    out.append(f"  burn charged        ${d['burn']:.4f}  (${d['burn_tokens']:.4f} tokens + ${d['burn_vps']:.4f} VPS)")
+    fee_share = (100.0 * d["fees"] / d["equity"]) if d["equity"] else 0.0
+    out.append(f"  fees paid (venue)   ${d['fees']:.4f}  ({fee_share:.3f}% of equity)")
+    out.append(f"  burn charged        ${d['burn']:.4f}  "
+               f"(${d['burn_tokens']:.4f} tokens + ${d['burn_vps']:.4f} VPS)")
     out.append(f"  net of everything   ${d['equity'] - d['start']:+.4f}")
     out.append("=" * 100)
     return "\n".join(out)

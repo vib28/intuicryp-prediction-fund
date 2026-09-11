@@ -16,11 +16,20 @@ markets. Three paths are merged and de-duplicated by market id:
 
 Rejection reasons are recorded, not discarded — the audit needs to know what
 was skipped and why, otherwise 'we found no edge' is unfalsifiable.
+
+Scanning is TWO PHASES, and the split matters: every structural filter runs
+first with no network access at all, and only the survivors get their order
+book fetched — concurrently. Fetching books one at a time inside the filter
+loop made the fetch the slowest part of every cycle (~95 sequential CLOB
+round-trips, ~24s), and it fetched books for markets that were about to be
+rejected on a field we already had in hand.
 """
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
+import costs
 import venue
 
 MONTHS = ["january", "february", "march", "april", "may", "june", "july",
@@ -29,9 +38,9 @@ MONTHS = ["january", "february", "march", "april", "may", "june", "july",
 # Families we can price. Order matters: check more specific patterns first.
 _DIGITAL = re.compile(r"above-(\d+)(?:pt(\d+))?k", re.I)
 _TOUCH_DN = re.compile(r"dip-to-(\d+)(?:pt(\d+))?k", re.I)
-_TOUCH_DN_NUM = re.compile(r"dip-to-(\d{4,})(?![\dk])", re.I)
+_TOUCH_DN_NUM = re.compile(r"dip-to-(\d{4,})(?![\\dk])", re.I)
 _TOUCH_UP = re.compile(r"reach-(\d+)(?:pt(\d+))?k", re.I)
-_TOUCH_UP_NUM = re.compile(r"reach-(\d{4,})(?![\dk])", re.I)
+_TOUCH_UP_NUM = re.compile(r"reach-(\d{4,})(?![\\dk])", re.I)
 
 _UNDERLYING = [("bitcoin", "BTCUSDT"), ("btc", "BTCUSDT"),
                ("ethereum", "ETHUSDT"), ("eth", "ETHUSDT"),
@@ -74,10 +83,6 @@ def parse_family(slug: str) -> dict | None:
     if m:
         return {"family": "touch_up", "strike": float(m.group(1))}
     return None
-
-
-# backwards-compatible alias used by earlier probes
-parse_digital = parse_family
 
 
 def days_to(end_iso: str | None) -> float | None:
@@ -130,61 +135,134 @@ def discover(cfg: dict) -> list[dict]:
     return list(found.values())
 
 
+def _reject(rec: dict, reason: str, **extra) -> dict:
+    return {"slug": rec["slug"], "question": rec["question"],
+            "via": rec["discovered_via"], "reason": reason, **extra}
+
+
+def _screen_market(m: dict, u: dict, min_horizon: float) -> tuple[dict | None, dict | None]:
+    """Every filter that needs no network call.
+
+    Returns (record, None) to proceed to the book fetch, or (None, rejection).
+    """
+    slug = m.get("slug") or ""
+    rec = {"slug": slug, "question": (m.get("question") or "")[:90],
+           "discovered_via": m.get("_discovered_via")}
+    vol24 = float(m.get("volume24hr") or 0)
+    liq = float(m.get("liquidityNum") or m.get("liquidity") or 0)
+    dtr = days_to(m.get("endDate"))
+
+    if str(m.get("closed")).lower() == "true" or str(m.get("active")).lower() != "true":
+        return None, _reject(rec, "not_active")
+    if not m.get("enableOrderBook"):
+        return None, _reject(rec, "no_orderbook")
+    if not m.get("acceptingOrders"):
+        return None, _reject(rec, "not_accepting_orders")
+    if vol24 < u["min_volume_24h_usd"]:
+        return None, _reject(rec, "volume_below_floor", vol24=round(vol24))
+    # Depth floor. This was configured from the start but never actually
+    # applied — the check simply was not here, so `min_liquidity_usd` was a
+    # number nobody read. A $100 account that cannot see $1k of resting
+    # liquidity is trading a book it cannot get out of at a price it likes, and
+    # settlement is the only exit this fund has.
+    if liq < u["min_liquidity_usd"]:
+        return None, _reject(rec, "liquidity_below_floor", liquidity=round(liq))
+    if dtr is None or dtr < min_horizon or dtr > u["max_days_to_resolution"]:
+        return None, _reject(rec, "horizon_out_of_range",
+                             min_horizon_days=round(min_horizon, 4),
+                             days=round(dtr, 2) if dtr is not None else None)
+
+    tokens = venue.market_tokens(m)
+    if len(tokens) < 2:
+        return None, _reject(rec, "no_clob_tokens")
+
+    parsed = parse_family(slug)
+    symbol = underlying_for(slug)
+    if not parsed or not symbol:
+        return None, _reject(rec, "not_priceable_family")
+
+    rec.update({
+        "market_id": str(m.get("id")),
+        "symbol": symbol,
+        "family": parsed["family"],
+        "strike": parsed["strike"],
+        "token_id_yes": tokens[0],
+        "end_date": m.get("endDate"),
+        "days_to_resolution": dtr,
+        "volume24hr": vol24,
+        "liquidity": liq,
+        "tick": m.get("orderPriceMinTickSize"),
+        # The authoritative taker rate comes from the market payload via
+        # costs.fee_rate_for_market. Reading `feeSchedule.rate` inline duplicated
+        # that logic and dropped its feesEnabled fallback, so a market with fees
+        # enabled but no schedule would have been read as 0%.
+        "fee_rate": costs.fee_rate_for_market(m),
+        "fee_type": m.get("feeType"),
+        "fees_enabled": m.get("feesEnabled"),
+    })
+    return rec, None
+
+
+def _fetch_books(token_ids: list[str], workers: int) -> dict:
+    """Fetch many order books concurrently. Read-only, so safe to parallelise."""
+    out: dict = {}
+    if not token_ids:
+        return out
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(venue.order_book, t): t for t in token_ids}
+        for future in as_completed(futures):
+            token = futures[future]
+            try:
+                out[token] = future.result()
+            except Exception as exc:                   # noqa: BLE001
+                out[token] = exc
+    return out
+
+
 def scan(cfg: dict) -> tuple[list[dict], list[dict]]:
     """Return (candidates, rejections)."""
     u = cfg["universe"]
-    markets = discover(cfg)
     candidates, rejections = [], []
 
     # Cadence invariant, stated rather than magic-numbered: never hold a market
     # whose remaining life is shorter than a multiple of the scan interval, or
     # the fund is holding something it cannot observe between ticks.
     cadence_days = cfg["scan"]["interval_minutes"] / 1440.0
-    multiple = cfg["scan"].get("horizon_cadence_multiple", 6)
-    min_horizon = max(u["min_days_to_resolution"], cadence_days * multiple)
+    min_horizon = max(u["min_days_to_resolution"],
+                      cadence_days * cfg["scan"]["horizon_cadence_multiple"])
 
-    for m in markets:
-        slug = m.get("slug") or ""
-        q = m.get("question") or ""
-        vol24 = float(m.get("volume24hr") or 0)
-        liq = float(m.get("liquidityNum") or m.get("liquidity") or 0)
-        dtr = days_to(m.get("endDate"))
+    # Phase 1: everything decidable without a network call.
+    pending = []
+    for m in discover(cfg):
+        rec, rejection = _screen_market(m, u, min_horizon)
+        if rejection is not None:
+            rejections.append(rejection)
+        else:
+            pending.append(rec)
 
-        def reject(reason, **extra):
-            rejections.append({"slug": slug, "question": q[:90], "reason": reason,
-                               "via": m.get("_discovered_via"), **extra})
+    # Phase 2: fetch the survivors' books concurrently, then apply the
+    # book-dependent filters.
+    books = _fetch_books([r["token_id_yes"] for r in pending],
+                         cfg["scan"].get("book_fetch_workers", 8))
 
-        if str(m.get("closed")).lower() == "true" or str(m.get("active")).lower() != "true":
-            reject("not_active"); continue
-        if not m.get("enableOrderBook"):
-            reject("no_orderbook"); continue
-        if not m.get("acceptingOrders"):
-            reject("not_accepting_orders"); continue
-        if vol24 < u["min_volume_24h_usd"]:
-            reject("volume_below_floor", vol24=round(vol24)); continue
-        if dtr is None or dtr < min_horizon or dtr > u["max_days_to_resolution"]:
-            reject("horizon_out_of_range", min_horizon_days=round(min_horizon, 4),
-                   days=round(dtr, 2) if dtr is not None else None); continue
+    for rec in pending:
+        book = books.get(rec["token_id_yes"])
+        if isinstance(book, Exception):
+            rejections.append(_reject(rec, "book_fetch_failed", error=str(book)[:80]))
+            continue
+        if not book:
+            rejections.append(_reject(rec, "book_fetch_failed", error="empty book"))
+            continue
 
-        tokens = venue.market_tokens(m)
-        if len(tokens) < 2:
-            reject("no_clob_tokens"); continue
-
-        parsed = parse_family(slug)
-        symbol = underlying_for(slug)
-        if not parsed or not symbol:
-            reject("not_priceable_family"); continue
-
-        try:
-            book = venue.order_book(tokens[0])
-            bid, ask = venue.best_bid_ask(book)
-        except Exception as exc:                       # noqa: BLE001
-            reject("book_fetch_failed", error=str(exc)[:80]); continue
+        bid, ask = venue.best_bid_ask(book)
         if ask is None or bid is None:
-            reject("no_two_sided_book"); continue
+            rejections.append(_reject(rec, "no_two_sided_book"))
+            continue
         spread = ask - bid
         if spread > u["max_spread"]:
-            reject("spread_too_wide", spread=round(spread, 4)); continue
+            rejections.append(_reject(rec, "spread_too_wide", spread=round(spread, 4)))
+            continue
+
         # A near-certain strike has no room left to pay the fee, so we must not
         # TRADE it. But it still carries information about the market's implied
         # vol, and smile.py needs a full strike ladder to establish a consensus.
@@ -193,31 +271,14 @@ def scan(cfg: dict) -> tuple[list[dict], list[dict]]:
         # Getting this wrong silently destroyed the entire daily universe: BTC
         # strikes are $2000 apart with ~1.6% daily vol, so only ~2 strikes sit
         # inside a 0.02-0.97 price band. Dropping the rest left groups of 2,
-        # below the 4-strike minimum for a vol consensus, and every daily
-        # market was discarded by the anchoring step.
-        dead_zone = ask <= u["min_ask"] or ask >= u["max_ask"]
-
+        # below the 4-strike minimum for a vol consensus, and every daily market
+        # was discarded by the anchoring step.
         candidates.append({
-            "market_id": str(m.get("id")),
-            "slug": slug,
-            "question": q,
-            "symbol": symbol,
-            "family": parsed["family"],
-            "strike": parsed["strike"],
-            "token_id_yes": tokens[0],
-            "end_date": m.get("endDate"),
-            "days_to_resolution": dtr,
-            "volume24hr": vol24,
-            "liquidity": liq,
+            **rec,
             "best_bid": bid,
             "best_ask": ask,
             "spread": spread,
-            "tick": m.get("orderPriceMinTickSize"),
-            "dead_zone": dead_zone,
-            "fee_rate": (m.get("feeSchedule") or {}).get("rate"),
-            "fee_type": m.get("feeType"),
-            "fees_enabled": m.get("feesEnabled"),
-            "discovered_via": m.get("_discovered_via"),
+            "dead_zone": ask <= u["min_ask"] or ask >= u["max_ask"],
             "book_bids": book.get("bids"),
             "book_asks": book.get("asks"),
         })

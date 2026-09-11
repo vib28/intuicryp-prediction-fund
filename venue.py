@@ -42,11 +42,36 @@ def vol_plan_for_horizon(days: float) -> tuple[str, int]:
             return interval, lookback
     return "4h", 168
 
+
 # Crypto-related Gamma tag ids (verified live): crypto=21, bitcoin=235,
 # ethereum=39. We scan the crypto tag and keep price-threshold markets.
 CRYPTO_TAG = 21
 
 _UA = {"User-Agent": "hermes-prediction-fund/1.0"}
+
+# --- per-cycle memoization --------------------------------------------------
+# The Forecaster prices ~80 markets per cycle, but they fall into only a handful
+# of distinct (symbol, horizon) pairs, and every market asked the API
+# independently: ~80 spot calls and ~80 kline calls where a couple of each would
+# do. That is a 20x waste of the upstream's goodwill, it is what made a cycle
+# take ~24s, and hammering a public API is how a fund gets rate-limited or
+# banned. The cache lives for the process, which for a cron cycle is one pass.
+_TTL_S = 120.0
+_CACHE: dict = {}
+
+
+def _cached(key, produce, ttl: float = _TTL_S):
+    hit = _CACHE.get(key)
+    if hit is not None and (time.time() - hit[0]) < ttl:
+        return hit[1]
+    value = produce()
+    _CACHE[key] = (time.time(), value)
+    return value
+
+
+def clear_cache() -> None:
+    """Drop memoized market data — for tests, and for long-lived processes."""
+    _CACHE.clear()
 
 
 def _get_json(url: str, timeout: int = 30, retries: int = 3):
@@ -122,6 +147,37 @@ def settled_market(market_id: str) -> dict:
     return _get_json(f"{GAMMA}/markets/{market_id}")
 
 
+def resolution_outcome(market: dict) -> bool | None:
+    """Resolve a market to YES/NO, or None while the oracle is still silent.
+
+    Returns True if the YES outcome won, False if NO won, None if the market is
+    not closed or the outcome prices are not yet decisive.
+
+    This parse existed twice — in cycle.py (settlement) and calibration.py
+    (grading) — with the same rules written out longhand in both. Two copies of
+    a settlement rule is one copy too many: a venue payload change would have
+    been applied to whichever file the reader happened to open.
+    """
+    if str(market.get("closed")).lower() != "true":
+        return None
+    raw = market.get("outcomePrices")
+    try:
+        prices = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not prices:
+        return None
+    try:
+        yes = float(prices[0])
+    except (TypeError, ValueError):
+        return None
+    if yes > 0.99:
+        return True
+    if yes < 0.01:
+        return False
+    return None
+
+
 def event_by_slug(slug: str) -> dict:
     """Fetch an event (with nested markets) by its slug.
 
@@ -142,12 +198,27 @@ def public_search(query: str, limit_per_type: int = 20) -> dict:
 # ------------------------------------------------------------------- Binance
 
 def spot(symbol: str = "BTCUSDT") -> float:
-    d = _get_json(f"{BINANCE}/api/v3/ticker/price?symbol={symbol}")
-    return float(d["price"])
+    """Current price, memoized per cycle."""
+    return _cached(
+        ("spot", symbol),
+        lambda: float(_get_json(f"{BINANCE}/api/v3/ticker/price?symbol={symbol}")["price"]),
+    )
 
 
 def realized_vol(symbol: str = "BTCUSDT", interval: str = "1h",
                  lookback: int = 168, ewma_halflife: float | None = None) -> dict:
+    """Annualised realized volatility from log returns, memoized per cycle.
+
+    See `_realized_vol` for the method.
+    """
+    return _cached(
+        ("vol", symbol, interval, lookback, ewma_halflife),
+        lambda: _realized_vol(symbol, interval, lookback, ewma_halflife),
+    )
+
+
+def _realized_vol(symbol: str, interval: str, lookback: int,
+                  ewma_halflife: float | None) -> dict:
     """Annualised realized volatility from log returns.
 
     `ewma_halflife` (in bars) weights recent returns more heavily, which

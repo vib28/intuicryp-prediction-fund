@@ -7,7 +7,7 @@
     "capital_usd": 100.0,
     "target_usd": 1000.0,
     "exit_policy": "hold_to_resolution",
-    "exit_policy_reason": "measured round-trip cost is 4%-42% of stake; only hold-to-resolution survives"
+    "exit_policy_reason": "measured round-trip cost is 2.5%-33.3% of stake; only hold-to-resolution survives"
   },
   "burn": {
     "vps_weekly_usd": 5.0,
@@ -19,6 +19,7 @@
     "pages": 6,
     "interval_minutes": 30,
     "horizon_cadence_multiple": 6,
+    "book_fetch_workers": 8,
     "rejections_max_bytes": 5000000,
     "daily_assets": ["bitcoin", "ethereum"],
     "daily_days_ahead": 3,

@@ -1,18 +1,21 @@
 """
-Self-test — proves the trading path actually works, and that the Auditor is
-not vacuous.
+Self-test — proves the trading path actually works, and that the Auditor is not
+vacuous.
 
-The live book currently offers no trade that clears the cost hurdle, which is
-the correct answer but leaves the money path unexercised. So we inject a
-synthetic dislocation into an ISOLATED temp state dir and assert the whole
-chain:
+The live book often offers no trade that clears the cost hurdle, which is the
+correct answer but leaves the money path unexercised. So we inject a synthetic
+dislocation into an ISOLATED temp state dir and assert the whole chain:
 
   1. a dislocation is approved and BOOKED
   2. the fill is priced from the raw book (not copied)
   3. the fee equals rate * shares * p * (1-p)
   4. the Auditor PASSES the honest book
-  5. the Auditor FAILS a tampered book          <-- the important one
-  6. settlement pays $1/share on a win, $0 on a loss, and equity replays
+  5. the Auditor FAILS a tampered book            <-- the integrity check
+  6. a repeat order MERGES, and the equity replay survives the `add` event
+  7. the percent cap check actually fires when breached
+  8. the Auditor FAILS an overstated equity base
+  9. settlement pays $1/share on a win, $0 on a loss, and equity replays
+ 10. hold-to-resolution has no exit path
 
 Run:  python3 selftest.py
 """
@@ -27,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import auditor          # noqa: E402
-import costs            # noqa: E402
+import config           # noqa: E402
 import ledger           # noqa: E402
 import risk             # noqa: E402
 
@@ -79,7 +82,7 @@ def synthetic_row() -> dict:
         "forecast": {
             "ok": True, "family": "digital_above", "symbol": "BTCUSDT",
             "spot": 77000.0, "strike": 70000.0, "years": 20 / 365,
-            "sigma_annual": 0.5, "sigma_market_median": 0.5,
+            "sigma_annual": 0.5, "sigma_market": 0.5,
             "sigma_realized": 0.5, "vol_disagreement_pct": 0.0,
             "p_mid": 0.90, "p_conservative": 0.90,
             "p_anchored": 0.90, "p_anchored_conservative": 0.90,
@@ -88,75 +91,109 @@ def synthetic_row() -> dict:
     }
 
 
+def set_fill_field(key: str, value) -> None:
+    """Mutate a fill entry in the isolated positions file."""
+    state = ledger.load_json(ledger.POSITIONS, {"positions": []})
+    state["positions"][0]["fills"][0][key] = value
+    ledger.save_json(ledger.POSITIONS, state)
+
+
 def main() -> int:
-    cfg = json.load(open(os.path.join(HERE, "config.json")))
+    cfg = config.load()
     tmp = isolate_state()
     try:
         print("SELFTEST — trading path and auditor integrity")
         print(f"  isolated state: {tmp}\n")
 
-        # ---- 1. approval + booking
-        row = synthetic_row()
-        approved, rejected = risk.evaluate([row], cfg)
+        # ---- approval + booking
+        approved, rejected = risk.evaluate([synthetic_row()], cfg)
         check("dislocation passes risk gate", len(approved) == 1,
               f"approved={len(approved)} rejected={len(rejected)}")
         if not approved:
             return 1
-        booked = risk.execute(approved, cfg)
-        booked = [b for b in booked if not b.get("skipped")]
+        booked = [b for b in risk.execute(approved, cfg) if not b.get("skipped")]
         check("position booked", len(booked) == 1, f"booked={len(booked)}")
         if not booked:
             return 1
         pos = booked[0]["position"]
 
-        # ---- 2. fill priced from the raw book
-        expect_shares = pos["all_in_usd"] / pos["cost_per_share"]
-        check("shares match stake/cost", abs(expect_shares - pos["shares"]) < 1e-6,
+        # ---- fill priced from the raw book
+        check("shares match stake/cost",
+              abs(pos["all_in_usd"] / pos["cost_per_share"] - pos["shares"]) < 1e-6,
               f"shares={pos['shares']:.4f}")
 
-        # ---- 3. fee identity
-        expected_fee = 0.07 * pos["shares"] * pos["vwap"] * (1 - pos["vwap"])
+        # ---- fee identity
+        fee_rate = float(pos["fills"][0]["vwap"])
+        expected_fee = 0.07 * pos["shares"] * fee_rate * (1 - fee_rate)
         check("fee identity holds", abs(expected_fee - pos["fee_usd"]) < 1e-6,
               f"fee={pos['fee_usd']:.6f} expected={expected_fee:.6f}")
 
-        # ---- 4. auditor passes the honest book
+        # ---- auditor on the honest book
         res = auditor.audit(cfg)
-        check("auditor PASSES honest book", res["passed"], f"findings={len(res['findings'])}")
-
-        # ---- 5. auditor catches tampering  (the integrity check that matters)
-        snap = (pos.get("fills") or [{}])[0].get("snapshot") or pos.get("snapshot")
-        with open(snap) as fh:
-            data = json.load(fh)
-        data["fill_as_booked"]["shares"] *= 1.5          # steal shares
-        with open(snap, "w") as fh:
-            json.dump(data, fh)
-        res = auditor.audit(cfg)
-        caught = not res["passed"]
-        check("auditor FAILS tampered book", caught,
+        check("auditor PASSES honest book", res["passed"],
               f"findings={[f['check'] for f in res['findings']]}")
 
-        # restore honest snapshot for settlement test
-        data["fill_as_booked"]["shares"] = pos["shares"]
+        # ---- auditor catches tampering (the check that matters)
+        snap = pos["fills"][0]["snapshot"]
+        with open(snap) as fh:
+            data = json.load(fh)
+        honest_shares = data["fill_as_booked"]["shares"]
+        data["fill_as_booked"]["shares"] = honest_shares * 1.5     # steal shares
         with open(snap, "w") as fh:
             json.dump(data, fh)
+        res = auditor.audit(cfg)
+        check("auditor FAILS tampered fill", not res["passed"],
+              f"findings={[f['check'] for f in res['findings']]}")
+        data["fill_as_booked"]["shares"] = honest_shares
+        with open(snap, "w") as fh:
+            json.dump(data, fh)
+        check("auditor PASSES once the snapshot is restored", auditor.audit(cfg)["passed"])
 
-        # ---- 6. settlement + equity replay
+        # ---- a repeat order MERGES, and the `add` event replays cleanly
+        # This is a regression test: `add` (a top-up) emits a different ledger
+        # kind from `open`, and the equity replay originally ignored it, so the
+        # first top-up would have produced a phantom audit failure forever.
+        approved2, _ = risk.evaluate([synthetic_row()], cfg)
+        booked2 = [b for b in risk.execute(approved2, cfg) if not b.get("skipped")]
+        opens = ledger.open_positions()
+        check("repeat order merges into one position", len(opens) == 1,
+              f"open positions={len(opens)}")
+        check("position now holds two fills", len(opens[0]["fills"]) == 2,
+              f"fills={len(opens[0]['fills'])}")
+        check("second fill booked", len(booked2) == 1)
+        res = auditor.audit(cfg)
+        check("auditor PASSES after a top-up (add-event replay)", res["passed"],
+              f"findings={[f['check'] for f in res['findings']]}")
+
+        # ---- the percent cap is not vacuous: shrink the equity base and it fires
+        honest_equity = ledger.load_json(ledger.POSITIONS, {"positions": []}) \
+            ["positions"][0]["fills"][0]["equity_before_usd"]
+        set_fill_field("equity_before_usd", 1.0)
+        res_low = auditor.audit(cfg)
+        check("percent cap FIRES when a fill exceeds it",
+              any(f["check"] == "pct_cap" for f in res_low["findings"]),
+              f"findings={[f['check'] for f in res_low['findings']]}")
+        set_fill_field("equity_before_usd", honest_equity)
+        check("percent cap holds on an honest book",
+              auditor.audit(cfg)["passed"])
+
+        # ---- settlement + equity replay
+        pos = ledger.open_positions()[0]
         before = ledger.totals()
         settled = ledger.settle_position(pos, won=True, evidence={"selftest": True})
         check("win pays $1/share",
               abs(settled["payout_usd"] - pos["shares"]) < 1e-6,
               f"payout={settled['payout_usd']:.4f} shares={pos['shares']:.4f}")
         after = ledger.totals()
-        expected_equity = before["cash_usd"] + pos["shares"]
         check("equity after win = cash + shares",
-              abs(after["equity_usd"] - expected_equity) < 1e-6,
-              f"equity={after['equity_usd']:.4f} expected={expected_equity:.4f}")
+              abs(after["equity_usd"] - (before["cash_usd"] + pos["shares"])) < 1e-6,
+              f"equity={after['equity_usd']:.4f}")
 
         res = auditor.audit(cfg)
         check("auditor PASSES after settlement", res["passed"],
               f"findings={[f['check'] for f in res['findings']]}")
 
-        # ---- 7. policy: hold-to-resolution has no exit path
+        # ---- policy: hold-to-resolution has no exit path
         check("no exit path exists in ledger",
               not any(hasattr(ledger, n) for n in ("close_position", "exit_position")))
 
@@ -164,7 +201,8 @@ def main() -> int:
         if FAILS:
             print(f"SELFTEST FAILED: {len(FAILS)} check(s): {FAILS}")
             return 1
-        print("SELFTEST PASSED — booking, fee math, auditor (incl. tamper detection) and settlement verified")
+        print("SELFTEST PASSED — booking, merge, fee math, auditor (incl. tamper "
+              "detection and cap enforcement) and settlement verified")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

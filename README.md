@@ -36,6 +36,7 @@ A four-agent **paper-trading fund** on Polymarket crypto markets.
 - [Running it](#running-it)
 - [Repository layout](#repository-layout)
 - [Build log: findings that changed the design](#build-log-findings-that-changed-the-design)
+- [Refactor log: what was wrong, and what changed](#refactor-log-what-was-wrong-and-what-changed)
 - [Known limitations](#known-limitations)
 - [Roadmap](#roadmap)
 
@@ -287,9 +288,11 @@ its squared error is nearly flat and it **down-weights itself**, while the
 near-money strike dominates. That is the right weighting, because near-money
 strikes are where the fund trades.
 
-Both values are stored (`sigma_market_median` = the fit,
-`sigma_market_median_raw` = the median) with `sigma_method` recorded in the
-forecast, so the choice is auditable rather than implicit.
+Both values are stored (`sigma_market` = the fit,
+`sigma_market_raw_median` = the median) with `sigma_method` recorded in the
+forecast, so the choice is auditable rather than implicit. The fit is the number
+the fund prices with; `smile.sigma_market_of()` reads either key, so predictions
+recorded before the rename remain usable evidence.
 
 ### Two traps that silently emptied the universe
 
@@ -375,13 +378,16 @@ It re-derives everything:
 |---|---|
 | **Fill fidelity** | re-walks the snapshot book and recomputes shares / vwap / fee / all-in |
 | **Fee identity** | the fee equals `rate · shares · p · (1−p)` at the market's own rate |
-| **Size caps** | no position exceeded the absolute cap when it opened |
+| **Aggregates** | a position's shares / all-in total equal the sum of its own fills |
+| **Absolute cap** | no position exceeded the dollar cap |
+| **Percent cap** | no single fill exceeded `max_position_pct` of equity **as it stood when that fill was made** |
 | **Hold invariant** | no exit event ever appears in the ledger |
-| **Equity replay** | cash derived by replaying the append-only ledger equals stored cash |
+| **Equity replay** | cash derived by replaying the append-only ledger (including `add` top-ups) equals stored cash |
 
-`selftest.py` proves the auditor is **not vacuous** by tampering with a stored
-fill (inflating shares by 1.5x) and asserting the audit FAILS. A green check
-that cannot go red is worth nothing.
+`selftest.py` proves the auditor is **not vacuous**, by making it fail on purpose
+four ways: a tampered snapshot (shares inflated 1.5x), an overstated equity base
+that must trip the percent cap, a top-up that must still replay cleanly, and the
+absence of any exit path. A green check that cannot go red is worth nothing.
 
 ---
 
@@ -395,8 +401,13 @@ total. That is precisely what allows the Auditor to disagree with the traders.
 fill, so a fill can be re-derived from first principles months later. The
 snapshot is the evidence; the ledger row is only a claim.
 
-`sizing_mode`, the cost hurdle and the burn all live in `config.json` with the
-reasoning inline.
+`sizing_mode`, the cost hurdle and the burn all live in `config.json`, and every
+module reads them through **`config.py`** — never by re-reading the file and
+never from a module-level constant. `config.validate()` fails loudly at load time
+if a required key is missing, so a bad edit surfaces as an error rather than as a
+quietly different strategy. (Two of the bugs in the [refactor
+log](#refactor-log-what-was-wrong-and-what-changed) were exactly that failure:
+a config key that no code read at all.)
 
 Runtime state is **not** committed (`.gitignore`): it changes every cycle.
 
@@ -405,12 +416,13 @@ Runtime state is **not** committed (`.gitignore`): it changes every cycle.
 ## Running it
 
 ```bash
-python3 cycle.py --dry-run   # full pipeline, books nothing
+python3 cycle.py --dry-run   # full pipeline, writes nothing at all
 python3 cycle.py             # live paper cycle (accrues burn, settles, books)
-python3 report.py            # economics + live state
+python3 report.py            # economics + live state + calibration
 python3 table.py             # the full trade table (see below)
-python3 selftest.py          # integrity harness (10 checks incl. tamper detection)
+python3 selftest.py          # 17-check integrity harness (tamper + cap detection)
 python3 auditor.py           # standalone audit, exit 1 on findings
+python3 probe.py             # one pass, timed, with upstream call counts
 ```
 
 **`table.py`** renders the whole book in one view: every trade (open and
@@ -470,24 +482,32 @@ a message, or the signal drowns.
 
 ```
 costs.py        fee curve, fill simulation, Kelly, edge-after-costs   ← the core
-venue.py        Gamma + CLOB + Binance clients (read-only, no signing)
-scout.py        Agent 1 — discovery (3 paths) and universe filtering
+venue.py        Gamma + CLOB + Binance clients; per-cycle memoization,
+                and the single resolution-outcome parser
+config.py       single source of truth for policy (validated + cached)
+scout.py        Agent 1 — discovery (3 paths); structural screen, then
+                concurrent order-book fetch for the survivors
 forecaster.py   Agent 2 — digital and one-touch barrier models
 smile.py        implied-vol consensus anchoring (see correction above)
 risk.py         Agent 3 — sizing, cost gate, paper fills, survival ladder
-auditor.py      Agent 4 — independent verification
+auditor.py      Agent 4 — independent verification, six named checks
 ledger.py       append-only ledger, burn accrual, settlement (no exit path)
-cycle.py        orchestration of the four agents
-report.py       economics + live state
+cycle.py        orchestration of the four agents; --dry-run writes nothing
+report.py       economics + live state + calibration
 table.py        the full trade table: type, PnL, fees, burn split
 calibration.py  grades every prediction against its real outcome (Brier/skill)
 notify.py       decides whether a cycle deserves a message
-selftest.py     integrity harness, incl. auditor tamper detection
+selftest.py     17-check integrity harness (tamper detection, cap enforcement,
+                top-up replay, merge semantics, settlement)
+probe.py        measures one pass: stage timings + upstream call counts
+migrate_fills_merge.py
+                one-off (already applied): collapsed duplicate positions into
+                multi-fill positions. Kept as the record of that migration.
 run_cycle.sh    cron entrypoint (silent-unless-notable)
 skills/         agent skills shipped with the fund (versioned, not just on the box)
   calib/        "is the model honest?" — Brier/skill/reliability + what to do
   table/        the full trade table
-config.json     policy: capital, burn, limits, hurdles (reasoning inline)
+config.json     policy values, consumed via config.py
 ```
 
 ---
@@ -685,6 +705,142 @@ this market.
 Explicitly: **step 1 is not worth starting until calibration holds ~30+ graded
 distinct markets**, because below that a loop would be fitting noise — which is
 precisely the failure the predecessor shipped.
+
+---
+
+## Refactor log: what was wrong, and what changed
+
+A full pass over every file: read for correctness first, style second. The
+findings are listed because most of them were **silent** — the code ran, the
+audit passed, and the behaviour still was not what the config or the docstrings
+claimed.
+
+### Bugs that would have cost money or credibility
+
+**1. The equity replay ignored `add` events.** A repeat order on a market already
+held emits `add`, not `open`, and the replay only subtracted `open`. The first
+top-up the fund ever made would have produced a **phantom audit FAIL on every
+cycle from then on** — and the auditor, the one component whose job is to be
+trusted, would have looked like the broken thing. Fixed in
+`_verify_equity_replay`; `selftest.py` now books a real top-up and asserts the
+replay still balances.
+
+**2. A top-up reserved room under the cap using the GROSS stake,** while the cap
+applies to ALL-IN cost. So a top-up overshoots the cap **by exactly its own fee**.
+This is not hypothetical: it is how the live book came to hold a $21.01 position
+against a $20 limit. Room is now divided by `(1 + fee fraction)`, with a hard
+post-fill guard that refuses any fill that would push a market over the cap on
+the final numbers.
+
+**3. The percent cap was computed and never applied.** The auditor assigned
+`max_pct` and then never used it — only the absolute dollar cap was checked. The
+20%-of-equity rule was decorative: a fill could be 90% of the book and the audit
+would pass. Fills now record `equity_before_usd`, and each fill is checked
+against the percentage cap *as the book stood when that fill was made*. The
+selftest shrinks the equity base and asserts the check fires — an untested check
+is indistinguishable from no check.
+
+**4. `risk.min_ev_on_stake_pct` was shadowed by a module constant.** `risk.py`
+carried its own `MIN_EV_ON_STAKE_PCT = 3.0` and never read the config, so editing
+the hurdle in `config.json` **changed nothing**. That is the most dangerous kind
+of config failure, because it looks like it worked. The hurdle now comes from
+`config.min_ev_on_stake_pct(cfg)`, and `config.validate()` fails loudly on a
+missing required key.
+
+**5. `universe.min_liquidity_usd` was read by nothing.** A configured $1,000 depth
+floor was enforced nowhere at all. Now wired into the Scout's structural screen —
+measured live: the universe went 82 → 86 candidates, so unlike the old volume
+floor this one is not a disabler.
+
+**6. The calibration Telegram alert could never fire.** `notify.py` read
+`calibration["n"]`, `["skill"]` and `["brier"]` — none of which exist at the top
+level of `calibration.summary()`; the real values are nested under
+`one_per_market`. The feature looked implemented and was dead. It now reads the
+one-per-market sample (the honest one), and the broad `except` that hid the
+problem reports the error instead of swallowing it.
+
+**7. A dry run wrote state.** `risk.execute` wrote the fill snapshot *before*
+checking `dry_run`, and `--dry-run` still persisted `last_cycle.json` and
+recorded predictions. A dry run that mutates the live book is not a dry run.
+`--dry-run` now computes everything and writes nothing.
+
+**8. Settlement was parsed longhand in two places.** `cycle.settle_resolved` and
+`calibration.score` each re-implemented "closed AND outcomePrices decisive". Two
+copies of a settlement rule is one too many: a venue payload change would have
+been applied to whichever file the reader happened to open. Both now call
+`venue.resolution_outcome()`.
+
+### Performance: measured, not asserted
+
+`probe.py` runs one pass over the same live universe in both trees and counts
+upstream calls.
+
+| | before | after |
+|---|---|---|
+| cycle wall time | **29.6 s** | **3.7 s** |
+| Binance ticker calls | 84 | **2** |
+| Binance kline calls | 84 | **5** |
+| total upstream calls | 278 | **117** |
+
+Two structural causes:
+
+1. **No memoization.** ~85 markets were priced, but they fall into only a handful
+   of distinct `(symbol, horizon)` pairs, and every market called Binance
+   independently — 168 calls where 7 would do. `venue._cached` memoizes for the
+   life of the process, which for a cron cycle is exactly one pass.
+2. **Book fetches were serial, and inside the filter loop.** ~95 sequential CLOB
+   round-trips dominated the cycle, and books were fetched for markets that were
+   about to be rejected on a field already in hand. Scanning is now two phases:
+   every structural filter runs with no network access at all, then the
+   survivors' books are fetched concurrently (`scan.book_fetch_workers`).
+
+Note the honest part of that table: total upstream calls fell 58%, not 90%,
+because the 95 book fetches are irreducible — each is a distinct token. They are
+now concurrent instead of serial.
+
+### Clarity, dead code, and documentation that had drifted
+
+- **`sigma_market_median` → `sigma_market`.** It holds a least-squares fit, not a
+  median. The old name described a method the module had already replaced, so
+  every stored forecast **lied about itself**. The median survives as
+  `sigma_market_raw_median` (the fallback when the fit fails), and
+  `smile.sigma_market_of()` reads either key so already-recorded predictions stay
+  usable as evidence.
+- **The burn was duplicated in three places** — `config.json`, `ledger.py` and
+  `table.py`. A burn change would have been silently half-applied. All policy now
+  resolves through `config.py`, and the burn split (tokens/VPS) is derived rather
+  than re-declared.
+- **Unused code that existed *because* logic had been duplicated inline:**
+  `costs.round_trip_cost_pct` was unused while `report.py` re-derived the
+  round-trip cost by hand; `costs.fee_rate_for_market` was unused while `scout.py`
+  read `feeSchedule.rate` inline and silently dropped its `feesEnabled` fallback.
+  Both inline copies are gone and the shared functions are used. Also removed:
+  `ledger.fill_count`, the `parse_digital` alias, the unused `vol_window_bars`
+  override, an unused `Tuple` import, and a dead `exit_disp` assignment in
+  `table.py` that was immediately overwritten.
+- **Stale numbers corrected.** The round-trip cost was quoted as "4–42%" in both
+  the ledger docstring and `config.json`; the measured range is **2.5–33.3%**.
+  `smile.py`'s module docstring still described the median method it no longer
+  used. `calibration.py`'s docstring asserted the fund had taken ZERO trades.
+  `forecaster.py`'s docstring implied its realized vol was the traded number,
+  when `smile.py` re-anchors it — the docstring now says so.
+- **The auditor is an outline of six named checks** (`_verify_fills`,
+  `_verify_caps`, `_verify_hold_invariant`, `_verify_equity_replay`) rather than
+  one long function, so a *missing* check is visible by reading rather than by
+  noticing an absence.
+- **The selftest went from 10 assertions to 17**, covering merge semantics, the
+  add-event replay, cap enforcement, and settlement.
+
+### What was deliberately NOT changed
+
+- **The trading logic itself.** No threshold, model, or sizing rule was retuned.
+  A refactor that quietly changes behaviour is not a refactor, it is an untested
+  strategy change — and every number elsewhere in this README would silently stop
+  applying. The one behavioural change is the newly-enforced liquidity floor,
+  which was measured against the live universe before being accepted.
+- **The venue, the trading direction, the cost model.** Out of scope.
+- **`migrate_fills_merge.py` stays.** It is a completed one-off, but it is the
+  only record of how deduplicated positions became multi-fill positions.
 
 ---
 

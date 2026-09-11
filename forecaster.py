@@ -20,6 +20,12 @@ assumption is smuggled in):
 sigma comes from Binance REALIZED volatility, not implied — that is the honest
 weak point and it is labelled as such. Realized vol is backward-looking.
 
+It is also NOT the vol the fund finally trades on. This module produces the
+realized-vol view; smile.py then re-anchors every strike to the vol implied by
+the event's own sibling strikes, and risk.py trades that. The two-stage split is
+deliberate: an edge must survive BOTH "our vol says this is cheap" and "the
+market's own vol curve agrees", otherwise it is just a vol opinion.
+
 Because sigma is noisy we do not take the point estimate: we also price at
 sigma*0.8 and sigma*1.2 and keep the WORST case for the direction we would
 trade (buying YES). An edge that only exists at the point estimate is not an
@@ -65,14 +71,16 @@ def prob_touch(family: str, spot: float, strike: float, sigma: float, years: flo
     if family == "touch_up":
         if strike <= spot:
             return 1.0                                  # barrier already breached
-        a = math.log(strike / spot)                      # > 0
     elif family == "touch_down":
         if strike >= spot:
             return 1.0
-        a = math.log(strike / spot)                      # < 0
     else:
         return float("nan")
 
+    # Both directions then share one formula: the reflection principle gives
+    # P(max |X| >= |a|) = 2 * Phi(-|a| / (sigma*sqrt(T))) in log space, so the
+    # sign of the barrier distance cancels and only its magnitude matters.
+    a = math.log(strike / spot)
     return min(1.0, 2.0 * norm_cdf(-abs(a) / (sigma * math.sqrt(years))))
 
 
@@ -84,7 +92,7 @@ def _prob(family: str, spot: float, strike: float, sigma: float, years: float) -
     return float("nan")
 
 
-def forecast(candidate: dict, vol_window_bars: int | None = None) -> dict:
+def forecast(candidate: dict) -> dict:
     symbol = candidate["symbol"]
     strike = float(candidate["strike"])
     family = candidate["family"]
@@ -97,11 +105,9 @@ def forecast(candidate: dict, vol_window_bars: int | None = None) -> dict:
 
     # Horizon-matched vol: interval AND lookback are chosen from how long the
     # market has left to live, and recent returns are weighted more heavily
-    # (EWMA) because vol clusters. `vol_window_bars` is an explicit override for
-    # tests; production lets the horizon decide.
+    # (EWMA) because vol clusters. venue.realized_vol memoizes per cycle, so the
+    # ~80 markets collapse to a handful of Binance calls.
     interval, bars = venue.vol_plan_for_horizon(years * 365.0)
-    if vol_window_bars is not None:
-        bars = vol_window_bars
     halflife = max(2.0, bars / 3.0)
 
     try:

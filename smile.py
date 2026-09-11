@@ -21,18 +21,25 @@ THE FIX
 -------
 Don't use our vol. Use the market's OWN vol, recovered from its siblings.
 
-Within one event (same underlying, same expiry) there are ~11 strikes. Invert
-each strike's price to its implied vol, take the MEDIAN as the market's
-consensus vol for that expiry, then re-price every strike with that consensus.
-An edge now means exactly one thing:
+Within one event (same underlying, same expiry) there are ~11 strikes. Fit ONE
+sigma that best explains the whole strike ladder (least squares over log-sigma),
+then re-price every strike with it. An edge now means exactly one thing:
 
     this strike is mispriced relative to the vol curve its own siblings imply
 
 That is a real, testable dislocation rather than a vol opinion. Events with too
-few liquid strikes to establish a consensus are skipped.
+few strikes to establish a consensus are skipped.
 
-The realized-vol estimate is still computed and reported — as context, and so
-the vol disagreement is visible in the audit trail rather than hidden.
+Why a least-squares fit rather than the median of per-strike implied vols:
+saturation. A strike priced 0.998 barely moves as sigma changes, so its squared
+error is nearly flat and it contributes almost no gradient — it down-weights
+itself. A near-the-money strike is highly sensitive and dominates the fit, which
+is exactly right. A median treats a saturated strike as equally informative and
+biases the consensus toward the extremes. The naive median is still computed,
+stored as `sigma_market_raw_median`, and used as the fallback if the fit fails,
+so any disagreement between the two stays visible in the audit trail.
+
+The realized-vol estimate is likewise kept as context (`sigma_realized`).
 """
 
 import math
@@ -132,6 +139,35 @@ def _group_key(c: dict) -> tuple:
     return (c["symbol"], (c.get("end_date") or "")[:10], c["family"].split("_")[0])
 
 
+def _median_of_implied_vols(members: list[dict]) -> float | None:
+    """Fallback consensus: median of each strike's own implied vol.
+
+    Costly (one bisection per strike), so it is only evaluated when the ladder
+    fit fails — see `anchor`.
+    """
+    ivs = []
+    for c in members:
+        f = c["forecast"]
+        iv = implied_vol(float(c["best_ask"]), f["spot"], f["strike"],
+                         f["years"], f["family"])
+        if iv is not None:
+            ivs.append(iv)
+    return _median(ivs) if ivs else None
+
+
+def sigma_market_of(forecast: dict) -> float | None:
+    """The consensus sigma a forecast was anchored to.
+
+    Reads the current key and falls back to its pre-rename name, because
+    predictions recorded before the rename are still in the calibration file and
+    are still evidence.
+    """
+    value = forecast.get("sigma_market")
+    if value is None:
+        value = forecast.get("sigma_market_median")
+    return float(value) if value is not None else None
+
+
 def anchor(priced: list[dict]) -> tuple[list[dict], list[dict]]:
     """Attach market-consensus vol and the strike's deviation from it."""
     groups: dict[tuple, list[dict]] = {}
@@ -142,10 +178,7 @@ def anchor(priced: list[dict]) -> tuple[list[dict], list[dict]]:
     for key, members in groups.items():
         # Build the ladder from EVERY strike in the event, including the
         # near-certain ones the fund may not trade: they still inform the curve.
-        ladder = []
-        for c in members:
-            f = c["forecast"]
-            ladder.append((f["strike"], float(c["best_ask"])))
+        ladder = [(c["forecast"]["strike"], float(c["best_ask"])) for c in members]
         if len(ladder) < MIN_STRIKES_FOR_CONSENSUS:
             skipped.append({"group": list(key), "size": len(members),
                             "ladder": len(ladder), "reason": "no_vol_consensus"})
@@ -153,11 +186,7 @@ def anchor(priced: list[dict]) -> tuple[list[dict], list[dict]]:
 
         ref = members[0]["forecast"]
         sigma_fit = fit_sigma(ladder, ref["spot"], ref["years"], ref["family"])
-        ivs = [implied_vol(float(c["best_ask"]), c["forecast"]["spot"],
-                           c["forecast"]["strike"], c["forecast"]["years"],
-                           c["forecast"]["family"]) for c in members]
-        ivs = [v for v in ivs if v is not None]
-        sigma_median = _median(ivs) if ivs else None
+        sigma_median = None if sigma_fit is not None else _median_of_implied_vols(members)
         sigma_mkt = sigma_fit if sigma_fit is not None else sigma_median
         if sigma_mkt is None:
             skipped.append({"group": list(key), "size": len(members),
@@ -177,8 +206,12 @@ def anchor(priced: list[dict]) -> tuple[list[dict], list[dict]]:
             p_cons = min(finite) if finite else p_anchor
 
             f.update({
-                "sigma_market_median": sigma_mkt,
-                "sigma_market_median_raw": sigma_median,
+                # `sigma_market` is the consensus the fund actually prices with.
+                # It is a least-squares fit, which is why it is no longer called
+                # `sigma_market_median` — the old name described a method this
+                # module had already replaced, which made the audit trail lie.
+                "sigma_market": sigma_mkt,
+                "sigma_market_raw_median": sigma_median,
                 "sigma_method": ("least_squares_ladder_fit" if sigma_fit is not None
                                  else "median_of_implied_vols"),
                 "ladder_size": len(ladder),
@@ -189,7 +222,8 @@ def anchor(priced: list[dict]) -> tuple[list[dict], list[dict]]:
                 "p_anchored_conservative": p_cons,
                 # the number the fund actually trades on: anchored, worst-case vol
                 "p_trade": p_cons,
-                "iv_source": "median implied vol of sibling strikes (same underlying + expiry)",
+                "iv_source": ("least-squares sigma fit across the event's strike "
+                              "ladder (same underlying + expiry)"),
             })
             anchored.append({**c, "forecast": f})
 

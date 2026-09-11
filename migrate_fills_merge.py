@@ -11,9 +11,11 @@ Idempotent: positions already carrying a `fills` list are left alone, and
 already-merged markets are not merged twice.
 """
 
+import os
 import sys
 
-sys.path.insert(0, "/root/fund")
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 import ledger  # noqa: E402
 
 

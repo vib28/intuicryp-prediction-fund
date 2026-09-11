@@ -4,19 +4,24 @@ Mandate: decide HOW MUCH, fill against the real book, and refuse anything that
 does not clear its costs.
 
 This agent is the pessimist of the fund. Its default answer is "no".
+
+Every threshold it applies comes from config.py. It used to hold its own copy of
+the EV hurdle as a module constant, which meant `risk.min_ev_on_stake_pct` in
+config.json was decorative — editing it changed nothing. A policy number that
+does not reach the code applying it is worse than no config at all.
 """
 
 import json
 import os
+import time
 
+import config
 import costs
 import ledger
 
-FRACTIONAL_KELLY = 0.25     # of full Kelly. Full Kelly on an uncertain model is suicide.
-MIN_EV_ON_STAKE_PCT = 3.0   # expected value must clear this AFTER fees+spread
-
 
 def snapshot_path(pos_hint: str) -> str:
+    """Where the raw evidence for this fill is frozen for the Auditor."""
     os.makedirs(ledger.SNAPSHOTS, exist_ok=True)
     return os.path.join(ledger.SNAPSHOTS, f"{pos_hint}.json")
 
@@ -26,48 +31,54 @@ def trade_prob(forecast: dict) -> float:
 
     `p_trade` is the smile-anchored, worst-case-vol probability. Falling back to
     `p_conservative` would mean trading our own vol opinion, which is exactly
-    what smile.py exists to prevent — so the fallback is the realized-vol
-    conservative number only for diagnostics, never silently.
+    what smile.py exists to prevent — so the fallback is only for diagnostics,
+    never silent.
     """
     if "p_trade" in forecast:
         return float(forecast["p_trade"])
     return float(forecast.get("p_conservative", 0.0))
 
 
+def _rate(row: dict) -> float:
+    return float(row.get("fee_rate") or costs.DEFAULT_CRYPTO_RATE)
+
+
 def evaluate(priced: list[dict], cfg: dict) -> tuple[list[dict], list[dict]]:
     """Rank opportunities by expected value per dollar staked, net of costs."""
+    equity = ledger.totals()["equity_usd"]
+    probe_stake = min(float(cfg["risk"]["probe_stake_usd"]),
+                      cfg["risk"]["max_position_pct"] / 100.0 * equity)
+    if probe_stake <= 0:
+        return [], []
+
     rows = []
     for c in priced:
-        f = c["forecast"]
-        p = trade_prob(f)
-        # Price the fill at the size we could actually afford before sizing.
-        probe = min(cfg["risk"]["probe_stake_usd"], cfg["risk"]["max_position_pct"] / 100.0 * ledger.totals()["equity_usd"])
-        if probe <= 0:
-            continue
-        fill = costs.simulate_buy(
-            c["book_asks"], probe, rate=float(c["fee_rate"] or costs.DEFAULT_CRYPTO_RATE)
-        )
+        # Price the fill at the size we could actually afford, before sizing.
+        fill = costs.simulate_buy(c["book_asks"], probe_stake, rate=_rate(c))
         if not fill:
             continue
-        edge = costs.edge_after_costs(p, fill,
-                                     float(c["fee_rate"] or costs.DEFAULT_CRYPTO_RATE))
-        kelly = costs.kelly_fraction(p, fill.cost_per_share)
-        rows.append({**c, "probe_fill": fill, "edge": edge, "kelly_full": kelly})
+        p = trade_prob(c["forecast"])
+        rows.append({**c,
+                     "probe_fill": fill,
+                     "edge": costs.edge_after_costs(p, fill, _rate(c)),
+                     "kelly_full": costs.kelly_fraction(p, fill.cost_per_share)})
 
     rows.sort(key=lambda r: -r["edge"]["ev_on_stake_pct"])
 
+    hurdle = config.min_ev_on_stake_pct(cfg)
     approved, rejected = [], []
     for r in rows:
         reasons = []
         if r.get("dead_zone"):
             reasons.append(f"price_in_dead_zone:{r['best_ask']:.3f}")
-        if r["edge"]["ev_on_stake_pct"] < MIN_EV_ON_STAKE_PCT:
+        if r["edge"]["ev_on_stake_pct"] < hurdle:
             reasons.append(f"ev_below_hurdle:{r['edge']['ev_on_stake_pct']:.2f}%")
         if r["edge"]["edge_prob"] <= 0:
             reasons.append("no_probability_edge")
         if r["kelly_full"] <= 0:
             reasons.append("kelly_nonpositive")
-        if r["probe_fill"].depth_limited and r["probe_fill"].book_depth_usd < cfg["risk"]["min_book_depth_usd"]:
+        if (r["probe_fill"].depth_limited
+                and r["probe_fill"].book_depth_usd < cfg["risk"]["min_book_depth_usd"]):
             reasons.append(f"book_too_thin:{r['probe_fill'].book_depth_usd:.0f}")
         (rejected if reasons else approved).append({**r, "reasons": reasons})
     return approved, rejected
@@ -93,33 +104,35 @@ def size(edge_row: dict, totals: dict, cfg: dict) -> float:
     Kelly is still computed and stored on every row so the over-betting is
     visible in the audit trail rather than hidden in a config flag.
     """
-    mode = cfg["risk"].get("sizing_mode", "fixed_fraction")
+    r = cfg["risk"]
     equity = totals["equity_usd"]
-    cash = totals["cash_usd"]
 
-    if mode == "kelly":
-        raw = equity * edge_row["kelly_full"] * cfg["risk"].get("fractional_kelly", FRACTIONAL_KELLY)
+    if r["sizing_mode"] == "kelly":
+        raw = equity * edge_row["kelly_full"] * r["fractional_kelly"]
     else:
-        raw = equity * cfg["risk"]["fixed_fraction_pct"] / 100.0
+        raw = equity * r["fixed_fraction_pct"] / 100.0
 
-    cap_usd = equity * cfg["risk"]["max_position_pct"] / 100.0
-    hard_cap = cfg["risk"]["absolute_max_position_usd"]
-    floor = cfg["risk"]["min_position_usd"]
-
-    stake = min(max(raw, floor), cap_usd, hard_cap, cash * 0.98)
+    stake = min(max(raw, r["min_position_usd"]),
+                equity * r["max_position_pct"] / 100.0,
+                r["absolute_max_position_usd"],
+                totals["cash_usd"] * 0.98)
     return max(0.0, stake)
 
 
 def execute(approved: list[dict], cfg: dict, dry_run: bool = False) -> list[dict]:
     """Book paper positions, subject to concurrency and survival policy."""
-    booked = []
-    totals = ledger.totals()
-    equity = totals["equity_usd"]
-    max_concurrent = cfg["risk"]["max_concurrent_positions"]
+    if dry_run:
+        return []
 
-    mode = survival_mode(equity, cfg)
+    totals = ledger.totals()
+    mode = survival_mode(totals["equity_usd"], cfg)
     if mode != "normal":
         return [{"skipped": True, "reason": f"survival_mode:{mode}"}]
+
+    r = cfg["risk"]
+    hurdle = config.min_ev_on_stake_pct(cfg)
+    cap_abs = r["absolute_max_position_usd"]
+    max_concurrent = r["max_concurrent_positions"]
 
     # Concurrency counts DISTINCT MARKETS, not fills. A repeat order on a market
     # already held merges into that position (ledger.open_position), so it takes
@@ -127,50 +140,58 @@ def execute(approved: list[dict], cfg: dict, dry_run: bool = False) -> list[dict
     # what the per-position limit should have meant all along. Polymarket has one
     # net balance per outcome token; there is no second ticket to block.
     open_by_market = {str(p.get("market_id")): p for p in ledger.open_positions()}
-    cap_abs = cfg["risk"]["absolute_max_position_usd"]
 
+    booked = []
     for row in approved:
         mid = str(row["market_id"])
-        held_pos = open_by_market.get(mid)
-        if held_pos is None and len(open_by_market) >= max_concurrent:
+        held = open_by_market.get(mid)
+        if held is None and len(open_by_market) >= max_concurrent:
             break
+
         stake = size(row, ledger.totals(), cfg)
-        if held_pos is not None:
-            room = cap_abs - float(held_pos.get("all_in_usd") or 0.0)
-            stake = min(stake, max(0.0, room))       # top up only within the cap
-        if stake < cfg["risk"]["min_position_usd"]:
+        rate = _rate(row)
+        if held is not None:
+            # Top up only within the absolute cap — and reserve room for the
+            # fee, because `stake` is a GROSS target while the cap applies to
+            # ALL-IN cost. Comparing gross room against an all-in total let a
+            # top-up overshoot the cap by exactly its own fee, which is how a
+            # book ends up with a $21.01 position against a $20 limit.
+            room = cap_abs - float(held.get("all_in_usd") or 0.0)
+            fee_frac = rate * (1.0 - float(row.get("best_ask") or 0.5))
+            stake = min(stake, max(0.0, room / (1.0 + fee_frac)))
+        if stake < r["min_position_usd"]:
             continue
 
-        rate = float(row["fee_rate"] or costs.DEFAULT_CRYPTO_RATE)
         fill = costs.simulate_buy(row["book_asks"], stake, rate=rate)
         if not fill:
             continue
+        if held is not None and (float(held.get("all_in_usd") or 0.0) + fill.all_in_usd
+                                 > cap_abs + 1e-9):
+            continue      # hard guard: never breach the cap on the final numbers
         p = trade_prob(row["forecast"])
         edge = costs.edge_after_costs(p, fill, rate)
-        if edge["ev_on_stake_pct"] < MIN_EV_ON_STAKE_PCT:
-            continue                      # re-check at FINAL size: slippage may have killed it
+        if edge["ev_on_stake_pct"] < hurdle:
+            continue          # re-check at FINAL size: slippage may have killed it
 
-        pos_id = f"pos-{row['market_id']}-{int(ledger.time.time()*1000)}"
+        pos_id = f"pos-{row['market_id']}-{int(time.time()*1000)}"
         snap = snapshot_path(pos_id)
-        payload = {
-            "captured": ledger.now_iso(),
-            "market": {k: row[k] for k in ("market_id", "slug", "question", "end_date",
-                                           "fee_rate", "fee_type", "fees_enabled", "tick")},
-            "book_asks": row["book_asks"],
-            "book_bids": row["book_bids"],
-            "target_stake_usd": stake,
-            "fill_as_booked": {
-                "shares": fill.shares, "vwap": fill.vwap, "fee_usd": fill.fee_usd,
-                "all_in_usd": fill.all_in_usd, "levels_used": fill.levels_used,
-            },
-            "forecast": row["forecast"],
-            "edge": edge,
-        }
         with open(snap, "w") as fh:
-            json.dump(payload, fh, indent=2)
-
-        if dry_run:
-            continue
+            json.dump({
+                "captured": ledger.now_iso(),
+                "market": {k: row[k] for k in ("market_id", "slug", "question",
+                                               "end_date", "fee_rate", "fee_type",
+                                               "fees_enabled", "tick")},
+                "book_asks": row["book_asks"],
+                "book_bids": row["book_bids"],
+                "target_stake_usd": stake,
+                "fill_as_booked": {
+                    "shares": fill.shares, "vwap": fill.vwap,
+                    "fee_usd": fill.fee_usd, "all_in_usd": fill.all_in_usd,
+                    "levels_used": fill.levels_used,
+                },
+                "forecast": row["forecast"],
+                "edge": edge,
+            }, fh, indent=2)
 
         pos = ledger.open_position(
             market={"id": row["market_id"], "slug": row["slug"],
@@ -178,16 +199,12 @@ def execute(approved: list[dict], cfg: dict, dry_run: bool = False) -> list[dict
             token_id=row["token_id_yes"],
             outcome="Yes",
             fill=fill,
-            model_prob=trade_prob(row["forecast"]),
+            model_prob=p,
             forecast=row["forecast"],
             snapshot_path=snap,
+            extra={"target_stake_usd": stake, "edge": edge},
         )
-        pos["stake_usd"] = stake
-        pos["edge"] = edge
-        state = ledger.load_json(ledger.POSITIONS, {"positions": []})
-        state["positions"] = [pos if p.get("id") == pos["id"] else p for p in state["positions"]]
-        ledger.save_json(ledger.POSITIONS, state)
-
+        open_by_market[mid] = pos
         booked.append({"position": pos, "edge": edge})
     return booked
 

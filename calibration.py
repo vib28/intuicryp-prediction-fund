@@ -3,13 +3,13 @@ Calibration — is the model actually any good?
 
 WHY THIS EXISTS
 ---------------
-The fund has taken ZERO trades, because no dislocation has cleared the cost
-hurdle. That means we have no evidence about whether the model works, and
+The fund takes few trades, because most cycles find no dislocation that clears
+the cost hurdle. That means P&L is silent about whether the model works, and
 "we found no edge" is indistinguishable from "the model is broken".
 
-We do not need to risk money to find out. Every cycle prices ~57 markets, and
-every market resolves. So we record each prediction AND grade it at settlement,
-whether or not we traded it.
+We do not need to risk money to find out. Every cycle prices dozens of markets,
+and every market resolves. So we record each prediction AND grade it at
+settlement, whether or not we traded it.
 
 THE CLUSTERING TRAP (read this before trusting any number here)
 --------------------------------------------------------------
@@ -48,11 +48,18 @@ import time
 from datetime import datetime, timezone
 
 import ledger
+import smile
 import venue
 
 PREDICTIONS = os.path.join(ledger.STATE_DIR, "predictions.jsonl")
 BUCKET_HOURS = 12
 MAX_BYTES = 5_000_000
+
+# Reporting thresholds, deliberately not trading policy: below
+# MIN_EVIDENCE_MARKETS any skill number is noise, and MIN_USEFUL_SKILL is the
+# point below which an edge cannot pay a 3-9% round-trip cost hurdle.
+MIN_EVIDENCE_MARKETS = 30
+MIN_USEFUL_SKILL = 0.05
 
 
 def _bucket(ts: float | None = None) -> str:
@@ -95,7 +102,7 @@ def record(anchored: list[dict]) -> int:
             "days_to_resolution": c.get("days_to_resolution"),
             "p_trade": p,
             "p_mid": f.get("p_mid"),
-            "sigma_market": f.get("sigma_market_median"),
+            "sigma_market": smile.sigma_market_of(f),
             "sigma_realized": f.get("sigma_realized"),
             "ask": c.get("best_ask"),
             "end_date": c.get("end_date"),
@@ -131,29 +138,20 @@ def score(limit: int = 400) -> dict:
     """Grade every unresolved prediction whose market has now resolved."""
     rows = _load()
     todo = [r for r in rows if not r.get("scored")][:limit]
-    graded, by_key = 0, {}
+    by_key, graded = {}, 0
     for r in todo:
         try:
-            m = venue.settled_market(r["market_id"])
+            market = venue.settled_market(r["market_id"])
         except Exception:                              # noqa: BLE001
             continue
-        if str(m.get("closed")).lower() != "true":
-            continue
-        raw = m.get("outcomePrices")
-        try:
-            prices = json.loads(raw) if isinstance(raw, str) else list(raw or [])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not prices:
-            continue
-        yes = float(prices[0])
-        if not (yes > 0.99 or yes < 0.01):
-            continue                                   # closed, not decisive yet
+        won = venue.resolution_outcome(market)
+        if won is None:
+            continue                                   # not resolved, or not decisive
         r["scored"] = True
-        r["outcome"] = 1 if yes > 0.5 else 0
+        r["outcome"] = 1 if won else 0
         r["scored_ts"] = ledger.now_iso()
-        graded += 1
         by_key[r["key"]] = r
+        graded += 1
 
     if graded:
         with open(PREDICTIONS, "w") as fh:
@@ -201,27 +199,27 @@ def _one_per_market(rows: list[dict]) -> list[dict]:
 
 
 def summary() -> dict:
-    graded = [r for r in _load()
-              if r.get("scored") and r.get("outcome") is not None]
+    rows = _load()                                     # one read, not two
+    graded = [r for r in rows if r.get("scored") and r.get("outcome") is not None]
     per_market = _one_per_market(graded)
     return {
         "all": _stats(graded),
         "one_per_market": _stats(per_market),
         "distinct_markets": len(per_market),
-        "pending": len([r for r in _load() if not r.get("scored")]),
+        "pending": sum(1 for r in rows if not r.get("scored")),
     }
 
 
 def verdict(s: dict) -> str:
     """One line the LP can act on, deliberately blunt."""
     m = s["one_per_market"]
-    if s["distinct_markets"] < 30:
+    if s["distinct_markets"] < MIN_EVIDENCE_MARKETS:
         return (f"NOT ENOUGH EVIDENCE — {s['distinct_markets']} distinct markets graded "
                 f"({s['pending']} pending). Do not draw conclusions yet.")
     if m["skill"] <= 0:
         return (f"MODEL FAILS — skill {m['skill']:+.4f} is no better than a coin flip "
                 f"over {m['n']} markets. Do not trade on p_trade until this is fixed.")
-    if m["skill"] < 0.05:
+    if m["skill"] < MIN_USEFUL_SKILL:
         return (f"MARGINAL — skill {m['skill']:+.4f} over {m['n']} markets. Beats a coin "
                 f"flip but not by enough to overcome a 3-9% cost hurdle.")
     return (f"MODEL HOLDS — skill {m['skill']:+.4f} over {m['n']} markets. "

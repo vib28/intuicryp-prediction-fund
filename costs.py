@@ -43,7 +43,7 @@ anything. That comparison lives in `edge_after_costs`.
 """
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 
 DEFAULT_CRYPTO_RATE = 0.07  # crypto_fees_v2; read per-market via feeSchedule
 
