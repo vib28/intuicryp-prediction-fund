@@ -90,7 +90,6 @@ def build() -> dict:
     acct = ledger.load_json(ledger.ACCOUNT, {})
     positions = sorted(ledger.all_positions(), key=lambda p: p.get("opened") or "")
     burn_weekly = config.burn_total_weekly()
-    burn_tokens_share, burn_vps_share = config.burn_split()
 
     rows = []
     real = unreal = fees = 0.0
@@ -129,15 +128,23 @@ def build() -> dict:
         })
 
     burn = float(acct.get("burn_accrued_usd", 0.0))
-    equity = ledger.totals()["equity_usd"]
+    totals = ledger.totals()
+    # Attribute burn by what actually caused it, from the ledger — not by
+    # re-applying the baseline ratio, which would silently smear a one-off
+    # bill (an agent/dev token session) across the VPS share too.
+    by_cat = totals["burn_by_category"]
+    one_off = ledger.one_off_burns()
+    equity = totals["equity_usd"]
     return {
         "rows": rows,
         "realized": real,
         "unrealized": unreal,
         "fees": fees,
         "burn": burn,
-        "burn_tokens": burn * burn_tokens_share,
-        "burn_vps": burn * burn_vps_share,
+        "burn_tokens": by_cat["tokens"],
+        "burn_vps": by_cat["vps"],
+        "one_off_burn": sum(float(e.get("amount_usd") or 0) for e in one_off),
+        "one_off_events": one_off,
         "burn_weekly": burn_weekly,
         "burn_tokens_weekly": config.burn_tokens_weekly(),
         "burn_vps_weekly": config.burn_vps_weekly(),
@@ -168,6 +175,12 @@ def render(d: dict) -> str:
     multiple = d["target"] / d["start"] if d["start"] else 0.0
     out.append(f"TARGET    ${d['target']:,.0f} ({multiple:.0f}x)   "
                f"runway at zero edge: {runway:.1f} weeks")
+    if d["one_off_burn"]:
+        out.append(f"ADJUSTED  ${d['one_off_burn']:.4f} of burn was billed, not accrued "
+                   f"({len(d['one_off_events'])} event(s)): all charged to tokens")
+        for e in d["one_off_events"]:
+            out.append(f"            {e.get('ts','')[:16]}Z  ${float(e.get('amount_usd') or 0):.4f}"
+                       f"  {e.get('reason') or '(no reason given)'}")
     out.append("")
 
     if not d["rows"]:

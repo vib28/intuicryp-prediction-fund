@@ -228,7 +228,20 @@ def verdict(s: dict) -> str:
 
 def render() -> str:
     s = summary()
-    out = ["CALIBRATION — is the model honest?", "=" * 72]
+    t = ledger.totals()
+    by_cat = t["burn_by_category"]
+    one_off = sum(float(e.get("amount_usd") or 0) for e in ledger.one_off_burns())
+    out = [
+        "CALIBRATION — is the model honest?",
+        "=" * 72,
+        # Carried here too, not just in table.py: a calibration report that hides
+        # what the answer cost is the same fiction as a P&L that ignores the burn.
+        f"  cost so far   : burn ${t['burn_accrued_usd']:.4f} "
+        f"(${by_cat['tokens']:.4f} tokens + ${by_cat['vps']:.4f} VPS)"
+        + (f"  incl. ${one_off:.4f} billed outright" if one_off else ""),
+        f"  equity        : ${t['equity_usd']:.4f}",
+        "",
+    ]
     if s["distinct_markets"] == 0:
         out.append("  No graded predictions yet.")
         out.append(f"  Recorded, awaiting resolution: {s['pending']}")

@@ -156,6 +156,26 @@ problem instead of a 15% one. **$250 is the real first milestone, not $1,000.**
 
 Reproduce with `python3 report.py`.
 
+### Burn is a rate, but some bills just arrive
+
+`burn.total_weekly_usd` is a **rate**, accrue per second so it can never be
+forgotten. Some costs are not a rate: a long agent/dev session is a one-off
+invoice for tokens. Folding it into the rate would misdate it, dilute it across
+the whole week, and hide it — so it is booked as a single event instead:
+
+```bash
+python3 ledger.py --one-off-burn 3.00 tokens "hermes agent dev session"
+```
+
+The event stays `kind: "burn"` deliberately, so the Auditor's equity replay still
+reconciles against stored cash rather than drifting. What *does* change is the
+attribution: burn is tracked per category (`burn_by_category`) instead of being
+re-derived from the baseline 2:1 ratio, because re-deriving it would smear a
+tokens-only bill across the VPS share and quietly overstate infrastructure cost.
+`table.py` prints a separate `ADJUSTED` line listing every billed event and its
+reason, and `calibration.py` carries the same cost line, so neither report can
+hide what the work cost.
+
 ---
 
 ## The cost model
@@ -449,13 +469,14 @@ a week yields hundreds of graded outcomes. A Telegram ping fires once per
 
 ### Agent skills
 
-Both are versioned in `skills/` **and** installed on the box under
+All three are versioned in `skills/` **and** installed on the box under
 `~/.hermes/skills/trading/`, so the Telegram bot answers them:
 
 | skill | what it does |
 |---|---|
 | **`calib`** | runs `calibration.py`, then explains the **meaning** and **implications**: the Brier/skill/reliability numbers, a blunt verdict (NOT ENOUGH EVIDENCE / MODEL FAILS / MARGINAL / MODEL HOLDS), and what each reliability gap implies for policy |
 | **`table`** | runs `table.py` — every trade with its prediction type, fees, PnL and the burn split |
+| **`prediction-fund-ops`** | operating knowledge for the whole box: the fee-rate trap, the vol-anchoring pitfall, discovery paths, the four classes of silent failure this codebase has shipped, the selftest contract, and how to book one-off burn |
 
 A predictor is only useful if you know when it is lying, so `calib` refuses to
 characterise the model below 30 distinct graded markets and says so.
@@ -507,6 +528,7 @@ run_cycle.sh    cron entrypoint (silent-unless-notable)
 skills/         agent skills shipped with the fund (versioned, not just on the box)
   calib/        "is the model honest?" — Brier/skill/reliability + what to do
   table/        the full trade table
+  prediction-fund-ops/  operating knowledge: pitfalls, invariants, ops commands
 config.json     policy values, consumed via config.py
 ```
 

@@ -20,6 +20,7 @@ Design rules that matter:
 
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -32,6 +33,10 @@ POSITIONS = os.path.join(STATE_DIR, "positions.json")
 SNAPSHOTS = os.path.join(STATE_DIR, "snapshots")
 
 SECONDS_PER_WEEK = 7 * 24 * 3600
+
+# What burn is attributed to. "tokens" here means the agent/LLM spend, which is
+# the fund's dominant recurring cost and the one that moves with activity.
+CATEGORIES = ("tokens", "vps")
 
 
 def now_iso() -> str:
@@ -51,6 +56,7 @@ def ensure_state() -> None:
             "starting_equity_usd": config.capital(),
             "cash_usd": config.capital(),
             "burn_accrued_usd": 0.0,
+            "burn_by_category": {c: 0.0 for c in CATEGORIES},
             "last_burn_ts": time.time(),
         })
     if not os.path.exists(POSITIONS):
@@ -96,6 +102,39 @@ def read_ledger() -> list[dict]:
     return out
 
 
+def burn_by_category(acct: dict | None = None) -> dict:
+    """Burn split by what caused it: {"tokens", "vps"}.
+
+    Read from the account when tracked. Accounts written before this was tracked
+    fall back to splitting the historical total by the configured baseline ratio,
+    which is the best available attribution for spend already incurred.
+    """
+    acct = acct if acct is not None else load_json(ACCOUNT, {})
+    stored = acct.get("burn_by_category")
+    if stored:
+        return {c: float(stored.get(c, 0.0)) for c in CATEGORIES}
+    tokens_share, vps_share = config.burn_split()
+    total = float(acct.get("burn_accrued_usd", 0.0))
+    return {"tokens": total * tokens_share, "vps": total * vps_share}
+
+
+def _add_burn(acct: dict, amount: float, category: str | None = None) -> None:
+    """Book `amount` of burn, attributed to a named category or to the baseline.
+
+    The category split is derived BEFORE the running total is incremented,
+    because the derivation falls back to that total when it is absent.
+    """
+    split = burn_by_category(acct)
+    if category:
+        split[category] = split.get(category, 0.0) + amount
+    else:
+        tokens_share, vps_share = config.burn_split()
+        split["tokens"] += amount * tokens_share
+        split["vps"] += amount * vps_share
+    acct["burn_accrued_usd"] = float(acct.get("burn_accrued_usd", 0.0)) + amount
+    acct["burn_by_category"] = split
+
+
 def accrue_burn(apply: bool = True, cfg: dict | None = None) -> float:
     """Book the burn elapsed since the last accrual, and return it.
 
@@ -107,11 +146,35 @@ def accrue_burn(apply: bool = True, cfg: dict | None = None) -> float:
     amount = elapsed * burn_per_second(cfg)
     if apply and amount > 0:
         acct["cash_usd"] = float(acct.get("cash_usd", config.capital())) - amount
-        acct["burn_accrued_usd"] = float(acct.get("burn_accrued_usd", 0.0)) + amount
         acct["last_burn_ts"] = time.time()
+        _add_burn(acct, amount)
         save_json(ACCOUNT, acct)
         append_event("burn", amount_usd=round(amount, 6), elapsed_s=round(elapsed, 1))
     return amount
+
+
+def record_one_off_burn(amount_usd: float, category: str = "tokens",
+                        reason: str = "") -> dict:
+    """Book burn that did not accrue on a clock — a bill that arrived.
+
+    The baseline burn is a RATE (config.burn.total_weekly_usd spread per second).
+    Some costs are not: an agent/dev session is a one-off invoice for tokens, and
+    folding it into the rate would misdate it, dilute it across the whole week,
+    and hide it. So it is booked as a single `burn` event with a category and a
+    reason. It stays a `burn` event deliberately, so the Auditor's equity replay
+    still reconciles against stored cash instead of drifting.
+    """
+    if category not in CATEGORIES:
+        raise ValueError(f"unknown burn category {category!r}; expected one of {CATEGORIES}")
+    amount = float(amount_usd)
+    if amount < 0:
+        raise ValueError("a one-off burn cannot be negative")
+    acct = load_json(ACCOUNT, {})
+    acct["cash_usd"] = float(acct.get("cash_usd", config.capital())) - amount
+    _add_burn(acct, amount, category=category)
+    save_json(ACCOUNT, acct)
+    return append_event("burn", amount_usd=round(amount, 6), category=category,
+                        one_off=True, reason=reason)
 
 
 def _recompute(pos: dict) -> dict:
@@ -267,6 +330,38 @@ def totals() -> dict:
         "equity_usd": equity,
         "realized_pnl_usd": realized,
         "burn_accrued_usd": float(acct.get("burn_accrued_usd", 0.0)),
+        "burn_by_category": burn_by_category(acct),
         "starting_equity_usd": float(acct.get("starting_equity_usd", config.capital())),
         "open_count": len(opens),
     }
+
+
+def one_off_burns() -> list[dict]:
+    """Burn events that were billed, not accrued — e.g. agent/dev token spend."""
+    return [e for e in read_ledger()
+            if e.get("kind") == "burn" and e.get("one_off")]
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if args and args[0] == "--one-off-burn":
+        if len(args) < 2:
+            raise SystemExit("usage: ledger.py --one-off-burn <usd> "
+                             "[tokens|vps] [reason]")
+        event = record_one_off_burn(
+            float(args[1]),
+            args[2] if len(args) > 2 else "tokens",
+            " ".join(args[3:]),
+        )
+        t = totals()
+        print(json.dumps({
+            "recorded": event,
+            "burn_accrued_usd": round(t["burn_accrued_usd"], 6),
+            "burn_by_category": {k: round(v, 6) for k, v in t["burn_by_category"].items()},
+            "cash_usd": round(t["cash_usd"], 6),
+            "equity_usd": round(t["equity_usd"], 6),
+        }, indent=2))
+        raise SystemExit(0)
+    t = totals()
+    t["burn_by_category"] = {k: round(v, 6) for k, v in t["burn_by_category"].items()}
+    print(json.dumps(t, indent=2))
