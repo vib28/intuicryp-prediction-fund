@@ -372,9 +372,16 @@ Runtime state is **not** committed (`.gitignore`): it changes every cycle.
 python3 cycle.py --dry-run   # full pipeline, books nothing
 python3 cycle.py             # live paper cycle (accrues burn, settles, books)
 python3 report.py            # economics + live state
+python3 table.py             # the full trade table (see below)
 python3 selftest.py          # integrity harness (10 checks incl. tamper detection)
 python3 auditor.py           # standalone audit, exit 1 on findings
 ```
+
+**`table.py`** renders the whole book in one view: every trade (open and
+settled) with its **prediction type** (`BTC daily above`, `ETH weekly dip`, …),
+strike, entry, exit-or-live-mark, stake, fee, PnL $ and %, plus totals for
+realized/unrealized/net P&L, fees paid, and the burn split into
+$10 tokens + $5 VPS. It is wired to the Telegram bot via the `table` skill.
 
 **Deployment:** the fund runs on a VPS at `/root/fund`. This repository is the
 source; the box is the runtime.
@@ -405,6 +412,7 @@ auditor.py      Agent 4 — independent verification
 ledger.py       append-only ledger, burn accrual, settlement (no exit path)
 cycle.py        orchestration of the four agents
 report.py       economics + live state
+table.py        the full trade table: type, PnL, fees, burn split
 notify.py       decides whether a cycle deserves a message
 selftest.py     integrity harness, incl. auditor tamper detection
 run_cycle.sh    cron entrypoint (silent-unless-notable)
